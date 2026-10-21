@@ -1,0 +1,38 @@
+# ESP-IDF
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+*.bin
+*.elf
+*.map
+*.o
+
+# Node / 小程序
+node_modules/
+dist/
+unpackage/
+.DS_Store
+
+# Flutter
+.dart_tool/
+.packages
+build/
+*.iml
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 本地密钥与配置
+.env
+*.local
+secrets/
+
+# 日志与临时
+*.log
+logs/
+tmp/
