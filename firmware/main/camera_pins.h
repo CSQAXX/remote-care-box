@@ -45,18 +45,37 @@
 #define BOARD_I2C_SCL_PIN   2
 #define BOARD_I2C_FREQ_HZ   100000
 
+/* ---- 摄像头 SCCB 地址 (7 位) ---- */
+#define CAM_SCCB_ADDR       0x21    /* GC0308 */
+
 /* ---- AW9523B IO 扩展器 (XIO 编号) ---- */
-#define XIO_CAM_2V8_EN      14   /* 摄像头 2.8V 供电使能 */
-#define XIO_CAM_RESET       15   /* 摄像头复位 */
 #define XIO_KEY_K1           0   /* 板载按键 K1 (扩展器上, 低有效) */
 #define XIO_KEY_K2           1   /* 板载按键 K2 (扩展器上, 低有效) */
+#define XIO_ESP_ADC_SEL      4   /* ADC 选择 */
+#define XIO_PA_CTRL          5   /* 音频功放使能 */
+#define XIO_VDD_3V3_EN      11   /* 板载 3.3V 总电源使能 (不开摄像头就没电!) */
+#define XIO_VBAT_EN         12   /* 音频 VBAT 使能 */
+#define XIO_VDDA_3V3_EN     13   /* 音频 3.3V 电源使能 */
+#define XIO_CAM_2V8_EN      14   /* 摄像头 2.8V 供电使能 */
+#define XIO_CAM_RESET       15   /* 摄像头复位 */
 
 /* ---- 板载按键 ---- */
 #define BTN_BOOT_GPIO       0    /* BOOT 键 (GPIO0, 板载直连) */
 
-/* ---- Wi-Fi 配置：改成办公室 Wi-Fi ---- */
-#define WIFI_SSID           "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD       "YOUR_WIFI_PASSWORD"
+/* ---- Wi-Fi 配置 ----
+ *
+ * 两种模式 (改 WIFI_MODE_AP 那一行切换):
+ *   STA 模式: 板子连办公室 Wi-Fi, 电脑和板子在同一个局域网,
+ *              浏览器访问 http://<板子IP>:8080/
+ *   AP  模式: 板子自己开热点, 电脑连板子的热点,
+ *              浏览器访问 http://192.168.4.1:8080/  (固定 IP, 不用找)
+ *
+ * 当前默认 AP 模式 —— 前期验证最省事, 不依赖办公室路由器。
+ */
+#define WIFI_MODE_AP        1     /* 1=板子开热点, 0=板子连路由器 */
+
+#define WIFI_SSID           "kanhu-box"     /* AP 模式下就是热点名 */
+#define WIFI_PASSWORD       "12345678"      /* 热点密码, 至少 8 位 */
 
 /* ---- 按键触发时网页弹出的提示语：改这一行就能换文案 ---- */
 #define BUTTON_MESSAGE      "老人按了求助按钮"

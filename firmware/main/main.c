@@ -86,13 +86,26 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "已连接 Wi-Fi，内网 IP: " IPSTR, IP2STR(&event->ip_info.ip));
         xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_START) {
+        ESP_LOGI(TAG, "热点已启动，SSID: %s", WIFI_SSID);
+        xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
     }
 }
 
 static void wifi_init(void)
 {
     s_wifi_events = xEventGroupCreate();
-    s_netif = esp_netif_create_default_wifi_sta();
+
+    /*
+     * 初始化顺序不能错:
+     *   1) esp_netif_init()
+     *   2) esp_event_loop_create_default()  <- 少了这行，后面所有
+     *      esp_event_handler_register() 都会返回 ESP_ERR_INVALID_STATE
+     *   3) esp_wifi_init()
+     *   4) esp_netif_create_default_wifi_sta() / _ap()
+     */
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -100,19 +113,54 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 
-    wifi_config_t wifi_config = {
+#if WIFI_MODE_AP
+    /* ---- AP 模式: 板子自己开热点, IP 固定 192.168.4.1 ----
+     * 注意顺序: esp_wifi_set_config() 必须在 esp_wifi_set_mode() 之前,
+     * 否则会返回 ESP_ERR_WIFI_MODE (0x3005)。参照 IDF 官方 softap_sta 例程。
+     */
+    s_netif = esp_netif_create_default_wifi_ap();
+
+    wifi_config_t ap_cfg = {
+        .ap = {
+            .ssid     = WIFI_SSID,
+            .ssid_len = strlen(WIFI_SSID),
+            .channel  = 1,
+            .password = WIFI_PASSWORD,
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .required = false,
+            },
+        },
+    };
+    /*
+     * 注意顺序: 必须先 esp_wifi_set_mode() 再 esp_wifi_set_config()。
+     * esp_wifi_init() 之后模式是 WIFI_MODE_NULL，此时 set_config(WIFI_IF_AP)
+     * 会返回 ESP_ERR_WIFI_MODE (0x3005)。IDF 官方 softap_sta 例程用
+     * WIFI_MODE_APSTA，AP 单独模式在这版 IDF 上不被接受，这里跟着用 APSTA。
+     */
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "Wi-Fi 热点模式启动中 (SSID=%s)", WIFI_SSID);
+#else
+    /* ---- STA 模式: 板子连办公室 Wi-Fi ---- */
+    s_netif = esp_netif_create_default_wifi_sta();
+
+    wifi_config_t sta_cfg = {
         .sta = {
             .ssid     = WIFI_SSID,
             .password = WIFI_PASSWORD,
             .threshold.authmode = WIFI_AUTH_WPA_WPA2_PSK,
         },
     };
-
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "Wi-Fi 初始化完成");
+    ESP_LOGI(TAG, "Wi-Fi STA 模式启动中 (SSID=%s)", WIFI_SSID);
+#endif
 }
 
 /* ---------------- 共享 I2C (旧版驱动) ---------------- */
@@ -146,7 +194,7 @@ static void board_i2c_init(void)
              (int)BOARD_I2C_PORT, BOARD_I2C_SDA_PIN, BOARD_I2C_SCL_PIN);
 }
 
-/* 摄像头复位 + 2.8V 供电 (走 AW9523B) */
+/* 板载电源使能 + 摄像头复位 (走 AW9523B) */
 static void camera_power_reset(void)
 {
     if (aw9523b_init(BOARD_I2C_PORT, AW9523B_I2C_ADDR) != ESP_OK) {
@@ -154,21 +202,46 @@ static void camera_power_reset(void)
         return;
     }
 
-    /* XIO14 = 摄像头 2.8V 供电使能, XIO15 = 摄像头复位 */
-    aw9523b_set_output(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_CAM_2V8_EN, true);
-    aw9523b_set_output(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_CAM_RESET, true);
+    /*
+     * 严格照抄正点原子官方 atk_dnesp32s3_box3.cc 的 InitializeIoExpander() 电源序列。
+     * 关键: XIO11 (板载 3.3V) 必须打开，否则整板没电，摄像头 SCCB 不会应答。
+     * 另外官方代码用 esp_io_expander_set_dir 写的是 TCA9555 的方向寄存器 0x06，
+     * 而 AW9523B 的 0x06 是中断寄存器，所以官方实际上没改过方向，
+     * AW9523B 保持上电默认。这里我们显式设置成输出，效果一致且更可控。
+     */
+    static const uint8_t power_outputs[] = {
+        XIO_VDD_3V3_EN,   /* XIO11 板载 3.3V 总电源 */
+        XIO_VDDA_3V3_EN,  /* XIO13 音频 3.3V */
+        XIO_VBAT_EN,      /* XIO12 音频 VBAT */
+        XIO_PA_CTRL,      /* XIO5  音频功放 */
+        XIO_ESP_ADC_SEL,  /* XIO4  ADC 选择 */
+        XIO_CAM_2V8_EN,   /* XIO14 摄像头 2.8V */
+        XIO_CAM_RESET,    /* XIO15 摄像头复位 */
+    };
+    for (size_t i = 0; i < sizeof(power_outputs) / sizeof(power_outputs[0]); i++) {
+        aw9523b_set_output(BOARD_I2C_PORT, AW9523B_I2C_ADDR, power_outputs[i], true);
+    }
 
-    /* 上电 2.8V */
-    aw9523b_set_level(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_CAM_2V8_EN, true);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    /* 逐路拉高 */
+    for (size_t i = 0; i < sizeof(power_outputs) / sizeof(power_outputs[0]); i++) {
+        aw9523b_set_level(BOARD_I2C_PORT, AW9523B_I2C_ADDR, power_outputs[i], true);
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
 
-    /* 复位时序: 拉低保持 50ms -> 拉高等待 50ms */
+    /* 摄像头复位时序: 拉低保持 50ms -> 拉高等待 50ms */
     aw9523b_set_level(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_CAM_RESET, false);
     vTaskDelay(pdMS_TO_TICKS(50));
     aw9523b_set_level(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_CAM_RESET, true);
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    ESP_LOGI(TAG, "摄像头供电与复位完成");
+    /* 调试: 回读寄存器，确认电源/复位位真的写进去了 */
+    uint8_t cfg0 = 0, cfg1 = 0, out0 = 0, out1 = 0;
+    if (aw9523b_get_config(BOARD_I2C_PORT, AW9523B_I2C_ADDR, &cfg0, &cfg1) == ESP_OK &&
+        aw9523b_get_output(BOARD_I2C_PORT, AW9523B_I2C_ADDR, &out0, &out1) == ESP_OK) {
+        ESP_LOGI(TAG, "AW9523B CONFIG: P0=0x%02x P1=0x%02x | OUTPUT: P0=0x%02x P1=0x%02x",
+                 cfg0, cfg1, out0, out1);
+        ESP_LOGI(TAG, "  期望 P1 电源位: 3V3(bit3)=1 2V8(bit6)=1 RST(bit7)=1");
+    }
 }
 
 /* ---------------- 摄像头 ---------------- */
@@ -193,7 +266,7 @@ static camera_config_t camera_config = {
     .pin_href  = CAM_PIN_HREF,
     .pin_pclk  = CAM_PIN_PCLK,
 
-    .xclk_freq_hz = 10000000,
+    .xclk_freq_hz = 24000000,   /* 正点原子官方示例用 24MHz */
     .ledc_timer   = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
 
@@ -207,8 +280,39 @@ static camera_config_t camera_config = {
     .sccb_i2c_port = BOARD_I2C_PORT,
 };
 
+/* 摄像头诊断: 直接在 SCCB 上读 GC0308 的 PID, 定位探测失败原因 */
+static void camera_diag_sccb(void)
+{
+    uint8_t reg = 0xfe;
+    uint8_t dummy = 0x00;
+
+    /* GC0308 detect 流程: 先写 0xFE=0x00, 再读 0x00 得到 PID */
+    esp_err_t err = i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                               &reg, 1, 100 / portTICK_PERIOD_MS);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "SCCB: 写 0xFE 失败: %s", esp_err_to_name(err));
+    }
+
+    err = i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                     &dummy, 1, 100 / portTICK_PERIOD_MS);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "SCCB: 写 0x00 失败: %s", esp_err_to_name(err));
+    }
+
+    uint8_t pid = 0;
+    err = i2c_master_read_from_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                      &pid, 1, 100 / portTICK_PERIOD_MS);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "SCCB: 读 PID 失败 (0x%02x): %s", CAM_SCCB_ADDR, esp_err_to_name(err));
+        return;
+    }
+    ESP_LOGI(TAG, "SCCB: 0x%02x 读回 PID=0x%02x (GC0308 期望 0x9b)", CAM_SCCB_ADDR, pid);
+}
+
 static void camera_init(void)
 {
+    camera_diag_sccb();
+
     esp_err_t err = esp_camera_init(&camera_config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "摄像头初始化失败: 0x%x", err);
@@ -505,6 +609,15 @@ void app_main(void)
 
     wifi_init();
 
+#if WIFI_MODE_AP
+    /* AP 模式: 热点起来就能用, IP 固定 192.168.4.1 */
+    vTaskDelay(pdMS_TO_TICKS(500));
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "  1) 电脑连上 Wi-Fi 热点: %s", WIFI_SSID);
+    ESP_LOGI(TAG, "  2) 浏览器打开: http://192.168.4.1:%d/", HTTP_PORT);
+    ESP_LOGI(TAG, "  3) 画面地址:   http://192.168.4.1:%d/stream", HTTP_PORT);
+    ESP_LOGI(TAG, "========================================");
+#else
     ESP_LOGI(TAG, "等待 Wi-Fi 连接...");
     EventBits_t bits = xEventGroupWaitBits(s_wifi_events, WIFI_CONNECTED_BIT,
                                            pdFALSE, pdTRUE, pdMS_TO_TICKS(30000));
@@ -518,6 +631,7 @@ void app_main(void)
     } else {
         ESP_LOGE(TAG, "Wi-Fi 连接超时！请检查 camera_pins.h 里的 SSID/密码");
     }
+#endif
 
     http_server_start();
 

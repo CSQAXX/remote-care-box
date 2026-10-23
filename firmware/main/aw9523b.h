@@ -72,6 +72,23 @@ esp_err_t aw9523b_set_level(i2c_port_t port, uint8_t addr, uint8_t pin, bool hig
  */
 esp_err_t aw9523b_get_level(i2c_port_t port, uint8_t addr, uint8_t pin, bool *high);
 
+/**
+ * @brief 读回 CONFIG 寄存器 (调试用): bit=1 表示该脚是输入
+ */
+esp_err_t aw9523b_get_config(i2c_port_t port, uint8_t addr, uint8_t *p0, uint8_t *p1);
+
+/**
+ * @brief 直接写 CONFIG 寄存器 (调试用)
+ * @param p0 P0 方向位 (1=输入, 0=输出)
+ * @param p1 P1 方向位
+ */
+esp_err_t aw9523b_set_config_raw(i2c_port_t port, uint8_t addr, uint8_t p0, uint8_t p1);
+
+/**
+ * @brief 读回 OUTPUT 寄存器 (调试用)
+ */
+esp_err_t aw9523b_get_output(i2c_port_t port, uint8_t addr, uint8_t *p0, uint8_t *p1);
+
 #ifdef __cplusplus
 }
 #endif
