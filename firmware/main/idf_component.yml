@@ -1,0 +1,7 @@
+## IDF Component Manager Manifest File
+dependencies:
+  ## Required IDF version
+  idf:
+    version: '>=5.1.0'
+  # 摄像头驱动 (GC0308 / OV2640 等)
+  espressif/esp32-camera: '*'
