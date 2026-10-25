@@ -45,14 +45,48 @@
 #define BOARD_I2C_SCL_PIN   2
 #define BOARD_I2C_FREQ_HZ   100000
 
+/* ---- 板载 ST7789 LCD (SPI2) ----
+ * 引脚来自正点原子官方 board config.h
+ *   SCLK=15  MOSI=16  MISO=17  DC=48  CS=47
+ * 320x240, RGB565, SPI mode 0, 60MHz
+ */
+#define LCD_SCLK_PIN      15
+#define LCD_MOSI_PIN      16
+#define LCD_MISO_PIN      17
+#define LCD_DC_PIN        48
+#define LCD_CS_PIN        47
+#define LCD_WIDTH         320
+#define LCD_HEIGHT        240
+
 /* ---- 摄像头 SCCB 地址 (7 位) ---- */
 #define CAM_SCCB_ADDR       0x21    /* GC0308 */
 
-/* ---- AW9523B IO 扩展器 (XIO 编号) ---- */
+/*
+ * AW9523B XIO 编号 —— 与正点原子官方 atk_dnesp32s3_box3 的 config.h 严格对齐。
+ *
+ * 映射关系 (XIO0..7 -> P0_0..P0_7, XIO8..15 -> P1_0..P1_7):
+ *   XIO8  = P1_0   LCD 背光
+ *   XIO9  = P1_1   红色 LED
+ *   XIO10 = P1_2   蓝色 LED
+ *   XIO11 = P1_3   板载 3.3V 总电源使能
+ *   XIO12 = P1_4   音频 VBAT 使能
+ *   XIO13 = P1_5   音频 3.3V 使能
+ *   XIO14 = P1_6   摄像头 2.8V 使能
+ *   XIO15 = P1_7   摄像头复位
+ *
+ * 极性提醒 (照抄官方 InitializeIoExpander, 千万别凭直觉改):
+ *   - LCD 背光 XIO8: 低电平点亮 (官方写的是 set_level(XIO_LCD_BL, 0))
+ *   - 电源使能类:    高电平有效
+ *   - 摄像头复位:    低=复位中, 高=正常工作
+ *   - K1/K2:         低电平按下
+ */
 #define XIO_KEY_K1           0   /* 板载按键 K1 (扩展器上, 低有效) */
 #define XIO_KEY_K2           1   /* 板载按键 K2 (扩展器上, 低有效) */
 #define XIO_ESP_ADC_SEL      4   /* ADC 选择 */
 #define XIO_PA_CTRL          5   /* 音频功放使能 */
+#define XIO_LCD_BL           8   /* LCD 背光 —— 低电平点亮 (与官方一致, 勿改成高) */
+#define XIO_LED_RED          9   /* 红色 LED */
+#define XIO_LED_BLUE        10   /* 蓝色 LED */
 #define XIO_VDD_3V3_EN      11   /* 板载 3.3V 总电源使能 (不开摄像头就没电!) */
 #define XIO_VBAT_EN         12   /* 音频 VBAT 使能 */
 #define XIO_VDDA_3V3_EN     13   /* 音频 3.3V 电源使能 */

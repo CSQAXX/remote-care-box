@@ -37,6 +37,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_psram.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_camera.h"
 #include "esp_timer.h"
@@ -48,6 +49,7 @@
 #include "img_converters.h"
 #include "camera_pins.h"
 #include "aw9523b.h"
+#include "lcd_st7789.h"
 
 static const char *TAG = "kanhu";
 
@@ -76,12 +78,18 @@ static uint32_t             s_frame_count = 0;
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+#if !WIFI_MODE_AP
         esp_wifi_connect();
         ESP_LOGI(TAG, "Wi-Fi 启动，开始连接");
+#endif
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT);
+#if !WIFI_MODE_AP
+        /* 只有 STA 模式才需要重连。AP 模式下没有 STA 连接,
+         * 在这里反复 esp_wifi_connect() 只会刷屏, 还会反复打断摄像头 GDMA。 */
         ESP_LOGW(TAG, "Wi-Fi 断开，尝试重连");
         esp_wifi_connect();
+#endif
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "已连接 Wi-Fi，内网 IP: " IPSTR, IP2STR(&event->ip_info.ip));
@@ -194,27 +202,34 @@ static void board_i2c_init(void)
              (int)BOARD_I2C_PORT, BOARD_I2C_SDA_PIN, BOARD_I2C_SCL_PIN);
 }
 
-/* 板载电源使能 + 摄像头复位 (走 AW9523B) */
+/* 板载电源使能 + 背光 + 摄像头复位 (走 AW9523B) */
 static void camera_power_reset(void)
 {
     if (aw9523b_init(BOARD_I2C_PORT, AW9523B_I2C_ADDR) != ESP_OK) {
-        ESP_LOGW(TAG, "AW9523B 不可用，跳过摄像头电源/复位控制");
+        ESP_LOGW(TAG, "AW9523B 不可用，跳过电源/背光/复位控制");
         return;
     }
 
     /*
-     * 严格照抄正点原子官方 atk_dnesp32s3_box3.cc 的 InitializeIoExpander() 电源序列。
-     * 关键: XIO11 (板载 3.3V) 必须打开，否则整板没电，摄像头 SCCB 不会应答。
-     * 另外官方代码用 esp_io_expander_set_dir 写的是 TCA9555 的方向寄存器 0x06，
-     * 而 AW9523B 的 0x06 是中断寄存器，所以官方实际上没改过方向，
-     * AW9523B 保持上电默认。这里我们显式设置成输出，效果一致且更可控。
+     * 严格照抄正点原子官方 atk_dnesp32s3_box3.cc 的 InitializeIoExpander()：
+     *   - 方向: DRV_IO_EXP_OUTPUT_MASK = 0xFFFC (除 K1/K2 外全部输出)
+     *            DRV_IO_EXP_INPUT_MASK  = 0x0003 (K1/K2 是输入)
+     *   - 电源: XIO_VDD_2V8_EN=1 (摄像头), XIO_VDD_3V3_EN=1 (主电源),
+     *            XIO_VDDA_3V3_EN=1 (音频), XIO_VBAT_EN=1, XIO_PA_CTRL=1,
+     *            XIO_ESP_ADC_SEL=1
+     *   - 背光: XIO_LCD_BL=0  ← 关键！背光是低电平点亮，
+     *            AW9523B 上电默认输出锁存器全高，不显式拉低屏幕就是黑的
      */
+    aw9523b_set_output(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_KEY_K1, false);
+    aw9523b_set_output(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_KEY_K2, false);
+
     static const uint8_t power_outputs[] = {
-        XIO_VDD_3V3_EN,   /* XIO11 板载 3.3V 总电源 */
-        XIO_VDDA_3V3_EN,  /* XIO13 音频 3.3V */
-        XIO_VBAT_EN,      /* XIO12 音频 VBAT */
-        XIO_PA_CTRL,      /* XIO5  音频功放 */
         XIO_ESP_ADC_SEL,  /* XIO4  ADC 选择 */
+        XIO_PA_CTRL,      /* XIO5  音频功放 */
+        XIO_LCD_BL,       /* XIO8  背光 */
+        XIO_VDD_3V3_EN,   /* XIO11 板载 3.3V 总电源 */
+        XIO_VBAT_EN,      /* XIO12 音频 VBAT */
+        XIO_VDDA_3V3_EN,  /* XIO13 音频 3.3V */
         XIO_CAM_2V8_EN,   /* XIO14 摄像头 2.8V */
         XIO_CAM_RESET,    /* XIO15 摄像头复位 */
     };
@@ -222,10 +237,22 @@ static void camera_power_reset(void)
         aw9523b_set_output(BOARD_I2C_PORT, AW9523B_I2C_ADDR, power_outputs[i], true);
     }
 
-    /* 逐路拉高 */
-    for (size_t i = 0; i < sizeof(power_outputs) / sizeof(power_outputs[0]); i++) {
-        aw9523b_set_level(BOARD_I2C_PORT, AW9523B_I2C_ADDR, power_outputs[i], true);
+    /* 电源类全部拉高 */
+    static const uint8_t power_high[] = {
+        XIO_ESP_ADC_SEL,
+        XIO_PA_CTRL,
+        XIO_VDD_3V3_EN,
+        XIO_VBAT_EN,
+        XIO_VDDA_3V3_EN,
+        XIO_CAM_2V8_EN,
+    };
+    for (size_t i = 0; i < sizeof(power_high) / sizeof(power_high[0]); i++) {
+        aw9523b_set_level(BOARD_I2C_PORT, AW9523B_I2C_ADDR, power_high[i], true);
     }
+
+    /* 背光: 低电平点亮 (官方 InitializeIoExpander 明确写 0) */
+    aw9523b_set_level(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_LCD_BL, false);
+
     vTaskDelay(pdMS_TO_TICKS(100));
 
     /* 摄像头复位时序: 拉低保持 50ms -> 拉高等待 50ms */
@@ -234,13 +261,13 @@ static void camera_power_reset(void)
     aw9523b_set_level(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_CAM_RESET, true);
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    /* 调试: 回读寄存器，确认电源/复位位真的写进去了 */
+    /* 调试: 回读寄存器，确认电源/复位/背光位真的写进去了 */
     uint8_t cfg0 = 0, cfg1 = 0, out0 = 0, out1 = 0;
     if (aw9523b_get_config(BOARD_I2C_PORT, AW9523B_I2C_ADDR, &cfg0, &cfg1) == ESP_OK &&
         aw9523b_get_output(BOARD_I2C_PORT, AW9523B_I2C_ADDR, &out0, &out1) == ESP_OK) {
         ESP_LOGI(TAG, "AW9523B CONFIG: P0=0x%02x P1=0x%02x | OUTPUT: P0=0x%02x P1=0x%02x",
                  cfg0, cfg1, out0, out1);
-        ESP_LOGI(TAG, "  期望 P1 电源位: 3V3(bit3)=1 2V8(bit6)=1 RST(bit7)=1");
+        ESP_LOGI(TAG, "  期望: P1 bit3(3V3)=1 bit4(VBAT)=1 bit5(VDDA)=1 bit6(2V8)=1 bit7(RST)=1 bit0(BL)=0");
     }
 }
 
@@ -322,11 +349,65 @@ static void camera_init(void)
 
     sensor_t *s = esp_camera_sensor_get();
     if (s != NULL) {
-        ESP_LOGI(TAG, "摄像头型号 PID: 0x%04x (期望 GC0308 = 0x9a)", s->id.PID);
-        s->set_vflip(s, 1);
+        /* GC0308 的 PID 是 0x9b（不是 0x9a，官方例程同样是 0x9b） */
+        ESP_LOGI(TAG, "摄像头型号 PID: 0x%04x (期望 GC0308 = 0x9b)", s->id.PID);
+        /*
+         * 不做 vflip / hmirror。
+         *
+         * 正点原子 BOX3 的官方配置是:
+         *   DISPLAY_SWAP_XY = true, DISPLAY_MIRROR_X = true, DISPLAY_MIRROR_Y = false
+         * 也就是说方向修正全部在 LCD 侧完成, 摄像头侧保持传感器原生朝向。
+         * 我们这边 LCD 的 swap_xy / mirror 参数与官方完全一致,
+         * 所以摄像头侧再翻一次就会上下颠倒 (之前加 set_vflip(s,1) 导致画面反了)。
+         */
         s->set_brightness(s, 1);
     }
     ESP_LOGI(TAG, "摄像头初始化成功");
+}
+
+/* ---------------- 摄像头预览任务 ---------------- */
+
+/*
+ * 把摄像头画面直接推到 LCD 上。
+ *
+ * GC0308 输出 RGB565，帧缓冲在 PSRAM。
+ * esp32-camera 在 esp32s3 上不做字节交换，帧缓冲里是【大端】
+ * (高位字节在前)，而我们 LCD 配的是小端解读，所以这里逐像素交换。
+ */
+static void camera_preview_task(void *arg)
+{
+    int frames = 0;
+    int64_t t0 = 0;
+
+    while (true) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb == NULL) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        if (fb->format == PIXFORMAT_RGB565) {
+            lcd_draw_rgb565(fb->buf, fb->width * 2,
+                            0, 0, fb->width, fb->height,
+                            true /* 源是大端，需要交换 */);
+
+            /* 心跳: 证明画面在持续刷新, 且没有卡在 DMA 等待上 */
+            frames++;
+            if (frames == 1) {
+                t0 = esp_timer_get_time();
+            } else if (frames % 50 == 0) {
+                int64_t dt_us = esp_timer_get_time() - t0;   /* esp_timer 是微秒 */
+                ESP_LOGI(TAG, "预览: 已刷新 %d 帧 (%.1f fps), 画面尺寸 %dx%d",
+                         frames, (frames - 1) * 1000000.0 / (double)dt_us,
+                         fb->width, fb->height);
+            }
+        } else {
+            ESP_LOGW(TAG, "预览: 期望 RGB565，实际 %d", (int)fb->format);
+        }
+
+        esp_camera_fb_return(fb);
+        vTaskDelay(pdMS_TO_TICKS(100));   /* 约 10fps */
+    }
 }
 
 /* ---------------- HTTP 处理器 ---------------- */
@@ -503,6 +584,68 @@ static void http_server_start(void)
     ESP_LOGI(TAG, "HTTP 服务器已启动，端口 %d", HTTP_PORT);
 }
 
+/* ---------------- 任务创建辅助 ---------------- */
+
+/*
+ * 内部 RAM 很紧张 (Wi-Fi 驱动 + 相机 + LCD 都要内部内存)，
+ * FreeRTOS 默认从内部 RAM 分任务栈，很容易 xTaskCreate 失败
+ * (errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY = -1)。
+ * 所以这里显式从 PSRAM 分配栈，再手动建任务。
+ */
+static void task_start(void *fn, const char *name, uint32_t stack_bytes, UBaseType_t prio)
+{
+    /*
+     * ESP-IDF 5.x 的 xTaskCreateStatic 签名:
+     *   xTaskCreateStatic(fn, name, ulStackDepth(字节), pvParameters, prio, puxStackBuffer, pxTaskBuffer)
+     * 注意和原生 FreeRTOS 不同: 栈深度单位是字节, 且需要额外的 StaticTask_t。
+     */
+    StackType_t *stack = heap_caps_malloc(stack_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (stack == NULL) {
+        ESP_LOGE(TAG, "任务 %s 的栈分配失败 (PSRAM)", name);
+        return;
+    }
+
+    /*
+     * TCB (任务控制块) 必须放内部 RAM —— FreeRTOS 内核会直接访问它，
+     * 放 PSRAM 会触发 xPortCheckValidTCBMem 断言。
+     * 栈才是大头，放 PSRAM 没问题 (需 CONFIG_FREERTOS_TASK_STACK_ALLOW_EXT_MEM)。
+     */
+    StaticTask_t *tcb = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (tcb == NULL) {
+        ESP_LOGE(TAG, "任务 %s 的 TCB 分配失败 (内部RAM)", name);
+        heap_caps_free(stack);
+        return;
+    }
+
+    TaskHandle_t handle = xTaskCreateStatic((TaskFunction_t)fn, name, stack_bytes,
+                                            NULL, prio, stack, tcb);
+    if (handle == NULL) {
+        ESP_LOGE(TAG, "任务 %s 创建失败", name);
+        heap_caps_free(stack);
+        heap_caps_free(tcb);
+        return;
+    }
+    ESP_LOGI(TAG, "任务 %s 已启动", name);
+}
+
+/* ---------------- AW9523B 诊断任务 ---------------- */
+
+/*
+ * 蓝灯慢速心跳，确认 AW9523B 输出通路正常。
+ * 背光保持常亮（由 camera_power_reset 设置为低电平点亮）。
+ */
+static void aw9523b_diag_task(void *arg)
+{
+    aw9523b_set_output(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_LED_BLUE, true);
+
+    while (true) {
+        aw9523b_set_level(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_LED_BLUE, true);
+        vTaskDelay(pdMS_TO_TICKS(600));
+        aw9523b_set_level(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_LED_BLUE, false);
+        vTaskDelay(pdMS_TO_TICKS(1400));
+    }
+}
+
 /* ---------------- 按键任务 ---------------- */
 
 /*
@@ -510,14 +653,14 @@ static void http_server_start(void)
  *   1) BOOT 键 (GPIO0, 板载直连)
  *   2) K1 / K2 键 (AW9523B 扩展器上的 XIO0 / XIO1, 低有效)
  * 任一按下都会产生一个事件, 网页弹出提示语。
+ *
+ * 注意: K1/K2 的方向 (输入) 已在 camera_power_reset() 里设好, 这里不再重复写。
+ * 每 50ms 轮询一次, 如果每次都做「读 CONFIG + 写 CONFIG」的读改写,
+ * 会和摄像头的 SCCB 抢同一条 I2C 总线 (SDA=3/SCL=2), 反而更容易掉帧。
  */
 static bool aw_key_pressed(void)
 {
     bool high = true;
-
-    /* XIO0 / XIO1 配置成输入 */
-    aw9523b_set_output(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_KEY_K1, false);
-    aw9523b_set_output(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_KEY_K2, false);
 
     if (aw9523b_get_level(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_KEY_K1, &high) == ESP_OK) {
         if (!high) {
@@ -601,10 +744,22 @@ void app_main(void)
         return;
     }
 
-    ESP_LOGI(TAG, "PSRAM: %u bytes", (unsigned int)esp_psram_get_size());
+    ESP_LOGI(TAG, "PSRAM: %u bytes, 剩余堆: %u bytes",
+             (unsigned int)esp_psram_get_size(),
+             (unsigned int)esp_get_free_heap_size());
 
     board_i2c_init();
     camera_power_reset();
+
+    /* 屏幕: 背光已在 AW9523B 里打开, 这里初始化面板驱动 */
+    bool lcd_ok = (lcd_init() == ESP_OK);
+    if (lcd_ok) {
+        lcd_fill_screen(0x0000);      /* 先清黑，等摄像头画面 */
+        ESP_LOGI(TAG, "屏幕已初始化，等待摄像头画面");
+    } else {
+        ESP_LOGE(TAG, "屏幕初始化失败（不影响摄像头功能）");
+    }
+
     camera_init();
 
     wifi_init();
@@ -635,7 +790,14 @@ void app_main(void)
 
     http_server_start();
 
-    xTaskCreate(button_task, "button_task", 3072, NULL, 5, NULL);
+    task_start(button_task, "button_task", 4096, 5);
+    task_start(aw9523b_diag_task, "aw_diag", 4096, 4);
+    if (lcd_ok) {
+        task_start(camera_preview_task, "cam_preview", 6144, 3);
+    }
+    ESP_LOGI(TAG, "内部剩余=%u 最小剩余=%u",
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned int)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
 
     printf("\nM1/M2 固件启动完成\n\n");
 }
