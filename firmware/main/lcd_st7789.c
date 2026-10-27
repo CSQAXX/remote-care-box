@@ -77,13 +77,28 @@ static SemaphoreHandle_t s_lcd_dma_done = NULL;  /* 已传完的批次数 */
 static SemaphoreHandle_t s_lcd_mutex    = NULL;  /* 互斥量: 防止多任务同时画 */
 
 /* SPI 传完一批颜色数据时回调 (在中断上下文触发) */
+/*
+ * SPI 一批颜色数据传完时的回调 (由 esp_lcd 的 post_cb 触发)。
+ *
+ * 关键: 这个回调运行在【SPI 驱动任务的上下文】, 是普通任务, 不是 ISR。
+ * 所以必须用 xSemaphoreGive (普通版), 不能用 xSemaphoreGiveFromISR。
+ *
+ * 之前误用了 GiveFromISR, 后果是信号量计数错乱:
+ *   "DMA 还没传完" 的信号被提前发出 -> 下一批数据覆写了正在被 DMA 读取的 buf
+ *   -> 画面出现随机撕裂/花屏 (表现为"偶尔闪一下、下方花")。
+ *
+ * esp-idf 的 post_cb 源码 (esp_lcd_panel_io_spi.c):
+ *   static void lcd_spi_post_trans_color_cb(spi_transaction_t *trans) {
+ *       ...
+ *       spi_panel_io->on_color_trans_done(&spi_panel_io->base, NULL, ...);
+ *   }
+ */
 static bool lcd_color_trans_done_cb(esp_lcd_panel_io_handle_t panel_io,
                                     esp_lcd_panel_io_event_data_t *edata,
                                     void *user_ctx)
 {
-    BaseType_t need_yield = pdFALSE;
-    xSemaphoreGiveFromISR(s_lcd_dma_done, &need_yield);
-    return need_yield;
+    xSemaphoreGive(s_lcd_dma_done);
+    return false;
 }
 
 esp_err_t lcd_init(void)

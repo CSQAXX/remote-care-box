@@ -68,7 +68,7 @@ static const char *TAG = "kanhu";
 #define JPEG_QUALITY    65
 
 /* 帧率策略: LCD 本地预览降频, 把 CPU 让给远程视频流 */
-#define LCD_PREVIEW_MS   500   /* LCD 预览间隔 (约 2 fps) */
+#define LCD_PREVIEW_MS   200   /* LCD 预览间隔 (约 2 fps) */
 #define STREAM_BUSY_MSG  "stream busy"
 
 /* ---------------- 自检模式 (定位花屏用) ----------------
@@ -690,23 +690,41 @@ static void camera_producer_task(void *arg)
                 s_clean_frames++;
             }
 
-            /* ---- 2) 编码 JPEG ---- */
-            int jpg_idx = -1;
-            if (slot_acquire(s_jpg_slots, &jpg_idx)) {
-                int64_t t_enc = esp_timer_get_time();
-                size_t jlen = encode_jpeg_to_slot(s_rgb_slots[rgb_idx].buf,
-                                                  fb->width, fb->height,
-                                                  s_jpg_slots[jpg_idx].buf);
-                s_jpg_encode_us = (uint32_t)(esp_timer_get_time() - t_enc);
+            /*
+             * ---- 2) 按需编码 JPEG ----
+             *
+             * 为什么"按需":
+             *   软件 JPEG 编码要 65ms/帧 (占整帧 71ms 的 92%),
+             *   而 ESP32-S3 没有硬件 JPEG 编码器, 这个开销躲不掉。
+             *
+             *   但绝大多数时候【没有任何人在看远程流】(只有本机 LCD 预览),
+             *   这时候编码纯浪费 —— 还会把 CPU 占满, 导致 LCD 刷新卡顿、
+             *   触发看门狗, 间接造成画面撕裂。
+             *
+             * 所以: 只有真的有人拉流 (s_stream_clients > 0) 才编码。
+             *   本地使用: 0% 的编码开销, 预览流畅
+             *   远程推流: 正常编码, 约 13fps (受限于 CPU, 无法更高)
+             */
+            if (s_stream_clients > 0) {
+                int jpg_idx = -1;
+                if (slot_acquire(s_jpg_slots, &jpg_idx)) {
+                    int64_t t_enc = esp_timer_get_time();
+                    size_t jlen = encode_jpeg_to_slot(s_rgb_slots[rgb_idx].buf,
+                                                      fb->width, fb->height,
+                                                      s_jpg_slots[jpg_idx].buf);
+                    s_jpg_encode_us = (uint32_t)(esp_timer_get_time() - t_enc);
 
-                if (jlen > 0) {
-                    s_jpg_slots[jpg_idx].len = jlen;
-                    s_jpg_bytes = (uint32_t)jlen;
-                    s_jpg_frames++;
-                    slot_publish(s_jpg_slots, jpg_idx);
-                } else {
-                    slot_release(s_jpg_slots, jpg_idx);
+                    if (jlen > 0) {
+                        s_jpg_slots[jpg_idx].len = jlen;
+                        s_jpg_bytes = (uint32_t)jlen;
+                        s_jpg_frames++;
+                        slot_publish(s_jpg_slots, jpg_idx);
+                    } else {
+                        slot_release(s_jpg_slots, jpg_idx);
+                    }
                 }
+            } else {
+                s_jpg_encode_us = 0;   /* 未编码 */
             }
 
             slot_publish(s_rgb_slots, rgb_idx);
