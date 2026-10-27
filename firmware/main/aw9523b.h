@@ -89,6 +89,16 @@ esp_err_t aw9523b_set_config_raw(i2c_port_t port, uint8_t addr, uint8_t p0, uint
  */
 esp_err_t aw9523b_get_output(i2c_port_t port, uint8_t addr, uint8_t *p0, uint8_t *p1);
 
+/**
+ * @brief 读回任意寄存器 (调试用)
+ */
+esp_err_t aw9523b_read_raw(i2c_port_t port, uint8_t addr, uint8_t reg, uint8_t *val);
+
+/**
+ * @brief 直接写 OUTPUT_P1 寄存器 (诊断用)
+ */
+esp_err_t aw9523b_write_output_p1(i2c_port_t port, uint8_t addr, uint8_t val);
+
 #ifdef __cplusplus
 }
 #endif

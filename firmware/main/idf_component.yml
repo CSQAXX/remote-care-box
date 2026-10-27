@@ -5,3 +5,7 @@ dependencies:
     version: '>=5.1.0'
   # 摄像头驱动 (GC0308 / OV2640 等)
   espressif/esp32-camera: '*'
+  # 注意: ST7789 面板驱动 IDF 5.3 内置在 esp_lcd 组件里
+  #       (components/esp_lcd/src/esp_lcd_panel_st7789.c)，无需外部依赖。
+  #       esp_lcd_st7789 独立组件在 components.espressif.com 上是 403，
+  #       所以不引外部包。

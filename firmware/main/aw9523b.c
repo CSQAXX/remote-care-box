@@ -127,9 +127,25 @@ esp_err_t aw9523b_set_config_raw(i2c_port_t port, uint8_t addr, uint8_t p0, uint
 
 esp_err_t aw9523b_get_output(i2c_port_t port, uint8_t addr, uint8_t *p0, uint8_t *p1)
 {
-    esp_err_t err = read_reg(port, addr, AW9523B_REG_OUTPUT_P0, p0);
-    if (err != ESP_OK) {
-        return err;
+    esp_err_t err = ESP_OK;
+    if (p0 != NULL) {
+        err = read_reg(port, addr, AW9523B_REG_OUTPUT_P0, p0);
+        if (err != ESP_OK) {
+            return err;
+        }
     }
-    return read_reg(port, addr, AW9523B_REG_OUTPUT_P1, p1);
+    if (p1 != NULL) {
+        err = read_reg(port, addr, AW9523B_REG_OUTPUT_P1, p1);
+    }
+    return err;
+}
+
+esp_err_t aw9523b_read_raw(i2c_port_t port, uint8_t addr, uint8_t reg, uint8_t *val)
+{
+    return read_reg(port, addr, reg, val);
+}
+
+esp_err_t aw9523b_write_output_p1(i2c_port_t port, uint8_t addr, uint8_t val)
+{
+    return write_reg(port, addr, AW9523B_REG_OUTPUT_P1, val);
 }

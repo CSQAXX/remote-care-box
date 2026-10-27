@@ -104,12 +104,13 @@
  *   AP  模式: 板子自己开热点, 电脑连板子的热点,
  *              浏览器访问 http://192.168.4.1:8080/  (固定 IP, 不用找)
  *
- * 当前默认 AP 模式 —— 前期验证最省事, 不依赖办公室路由器。
+ * 当前默认 STA 模式 —— 电脑不用切网络, 直接访问板子 IP 就能看画面。
+ * (产品最终也是这个架构: 设备主动连服务器, 电脑/小程序只是客户端)
  */
-#define WIFI_MODE_AP        1     /* 1=板子开热点, 0=板子连路由器 */
+#define WIFI_MODE_AP        0     /* 1=板子开热点, 0=板子连路由器 */
 
-#define WIFI_SSID           "kanhu-box"     /* AP 模式下就是热点名 */
-#define WIFI_PASSWORD       "12345678"      /* 热点密码, 至少 8 位 */
+#define WIFI_SSID           "WMU-EDU"
+#define WIFI_PASSWORD       "Woaini11"
 
 /* ---- 按键触发时网页弹出的提示语：改这一行就能换文案 ---- */
 #define BUTTON_MESSAGE      "老人按了求助按钮"

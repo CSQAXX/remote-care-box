@@ -134,6 +134,78 @@
 
 ---
 
+---
+
+## 性能与花屏专项（2026-10-27）
+
+### 背景
+
+M1/M2 打通后, 出现两个问题: 画面**一闪一闪** (花屏), 帧率只有 6.4 fps。
+
+### 根因与修复
+
+| 问题 | 根因 | 修复 | 验证 |
+| --- | --- | --- | --- |
+| 画面撕裂/花屏 | `fb_count=2`, 摄像头连续 DMA 写同一块缓冲, 应用读的时候下一帧已经覆盖上来 | `fb_count` 2 -> **4**, `grab_mode` 改 `CAMERA_GRAB_LATEST` | 撕裂帧计数 **6/350 -> 0/800** |
+| 画面闪烁 | JPEG 编码一帧 72ms 纯 CPU, 编码任务优先级高于 LCD 刷新, 把 LCD 饿死 | 自写 `jpeg_yield.cpp`: 编码每 16 行让出一次 CPU; LCD 任务优先级提到编码之上 | 待烧录复测 |
+| 帧率低 (6.4fps) | 1) 编译是 `-Og` (DEBUG) 2) 每帧 `frame2jpg` malloc 128KB 3) LCD 和视频流各编各的 | 1) 改 `CONFIG_COMPILER_OPTIMIZATION_PERF` (-O2) 2) 改流式回调, 零额外拷贝 3) 编码统一到生产者, 多客户端共用 | **6.4 -> 23.8 fps** |
+| 看门狗报警 | 编码任务连续 70ms 不让出 CPU | 拆成独立编码任务 + 编码中让出 | 36 次 -> **0 次** |
+| 正常模式摄像头没初始化 | `camera_init()` 只在诊断模式调用过 | 正常模式补上 | — |
+
+### 架构变更
+
+原来 LCD 预览和 MJPEG 视频流各自调 `esp_camera_fb_get()`, 两边抢同一个摄像头,
+而且各编一遍 JPEG (CPU 直接翻倍)。现在改成生产者-消费者:
+
+```
+cam_producer (prio 6)  取帧 -> 拷进 RGB565 槽位 -> 投递给编码队列
+    |                                    |
+    +-> lcd_slots (给 LCD 预览, prio 4)   +-> jpeg_enc (prio 3) -> jpg_slots -> MJPEG HTTP
+```
+
+关键点:
+- 帧槽位按用途分组 (`s_rgb_slots` / `s_lcd_slots` / `s_jpg_slots`),
+  因为 JPEG 编码任务占用槽位 72ms, 共用会导致 LCD 永远抢不到 -> 屏幕不刷新
+- 槽位策略是"最新帧优先": 旧帧直接丢弃, 不排队 (直播场景旧帧没价值)
+
+### 关键配置改动
+
+```ini
+# sdkconfig.defaults
+CONFIG_COMPILER_OPTIMIZATION_PERF=y      # 原来是 DEBUG (-Og), JPEG 编码慢好几倍
+```
+
+```c
+// main.c
+#define WIFI_ENABLE          1   # Wi-Fi 总开关, 排障时可关掉做对照实验
+#define LCD_PREVIEW_ENABLE   1   # LCD 预览开关, 排障时可关掉做对照实验
+#define JPEG_QUALITY        65   # 原来是 12 (jpge 是 1-100 越大越清晰, 12 等于最低质量)
+#define JPEG_YIELD_EVERY_LINES 16 # 编码每多少行让出一次 CPU
+#define LCD_PREVIEW_MS      500   # LCD 预览 ~2fps, 把 CPU 让给视频流
+```
+
+### 定位花屏的方法论（重要）
+
+之前的排查一直靠肉眼看, 分不清是"摄像头数据坏了"还是"显示出了问题"。
+这次加了两个**数字化**手段, 以后查类似问题都该这么干:
+
+1. **撕裂自动检测**: 拷贝帧缓冲前后各算一次 CRC, 不一致 = 这一帧在拷贝期间被 DMA 改写了。
+   计数打出来, 就不用盯着屏幕猜。
+2. **逐项对照实验**: 用编译期开关 (`WIFI_ENABLE` / `LCD_PREVIEW_ENABLE`) 逐个关掉功能,
+   一次只变一个变量, 看现象怎么变。这次就是靠"关掉 JPEG 编码 -> 不闪了"定位到真凶的。
+
+### 坑位记录
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| `reason=201` 一直连不上 Wi-Fi | 办公室 Wi-Fi 是 **5GHz** (信道 52), ESP32-S3 只支持 2.4GHz | 用 2.4G 热点; 或板子开 AP 模式 |
+| `reason=210` 握手超时 | 密码错, 或 AP 是 WPA2-企业认证 (ESP32 不支持 PEAP) | 换成 WPA2-PSK 个人版 |
+| `task_wdt: CPU 1: xxx` | 任务连续太久不让出 CPU | 拆任务 + 编码中 yield |
+| 编译报 `format '%u' expects unsigned int` | Xtensa 上 `uint32_t` 是 `long unsigned int` | 用 `PRIu32`, 不要 `(unsigned)` 强转 |
+| `WinError 6` 编译中断 | 收尾阶段文件句柄失效 (Windows) | 重跑一次增量构建即可 |
+
+---
+
 ## 结论记录
 
 - M0 实际耗时：____
