@@ -34,6 +34,7 @@
 #include "freertos/event_groups.h"
 
 #include "esp_wifi.h"
+#include "esp_http_client.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_log.h"
@@ -47,15 +48,32 @@
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 #include "driver/i2c.h"
+#include "driver/usb_serial_jtag.h"
 
 #include "img_converters.h"
+#include "jpeg_yield.h"
 #include "camera_pins.h"
 #include "aw9523b.h"
 #include "lcd_st7789.h"
+#include "audio_board.h"
+#include "g711.h"
+
+#include <math.h>
 
 static const char *TAG = "kanhu";
 
 #define HTTP_PORT       8080
+
+/*
+ * Wi-Fi 总开关。必须定义在文件靠前的位置 —— audio_selftest_loop()
+ * 里有 #if WIFI_ENABLE 的编译期分支, 定义晚了那里会当成 0。
+ *
+ * 0 = 完全不开 WiFi (纯本地显示, 最干净的对照组)
+ * 1 = 正常开 WiFi
+ */
+#ifndef WIFI_ENABLE
+#define WIFI_ENABLE 1
+#endif
 
 /*
  * JPEG 质量: 1-100, 越大越清晰 (jpge / libjpeg 的语义)。
@@ -66,6 +84,38 @@ static const char *TAG = "kanhu";
  * 质量越高 -> JPEG 越大 -> 编码越慢 -> 帧率越低, 需要和帧率一起权衡。
  */
 #define JPEG_QUALITY    65
+
+/*
+ * FreeRTOS tick 率 = 100Hz (CONFIG_FREERTOS_HZ=100), 也就是 1 tick = 10ms。
+ *
+ * 陷阱: pdMS_TO_TICKS(1) 在 tick 率 100Hz 下会被算成【0 tick】!
+ *       (1 * 100 / 1000 = 0), 于是 vTaskDelay(0) 退化成纯 taskYIELD(),
+ *       根本不会真正阻塞 —— 让出点等于没加。
+ *
+ * 所以这里直接用 tick 数 (vTaskDelay(1) = 10ms),
+ * 并且用编译期断言防止以后有人改错。
+ */
+#define APP_TICK_HZ      100
+#define APP_TICKS_PER_MS (APP_TICK_HZ / 1000)   /* 0 —— 说明 tick 率 < 1000 */
+#define APP_DELAY_TICKS  1                      /* = 10ms */
+
+/* 校验: 我们依赖 1 tick = 10ms 这个前提 */
+_Static_assert(APP_TICK_HZ == 100, "本固件假设 FreeRTOS tick 率是 100Hz (1 tick = 10ms)");
+
+/*
+ * JPEG 编码时每隔多少行让出一次 CPU。
+ *
+ * 背景: esp32-camera 的 fmt2jpg_cb() 编码时完全不让出 CPU (约 69ms),
+ *       会饿死 core0 的 IDLE0 -> 看门狗超时 -> 板子反复重启,
+ *       同时饿死 LCD 任务 -> 屏幕卡死 (看着像闪花屏)。
+ *
+ * 32 行 = 每 32 行阻塞 1 tick (10ms), 240 行共让出 7 次 = 额外 70ms。
+ * 编码耗时从 69ms 变成约 140ms (约 7fps), 换来稳定不重启 + LCD 不卡。
+ *
+ * 注意: 这是【有客户端拉流时】才走的路径。没人看视频流时
+ *       根本不编码, 完全没有这个开销。
+ */
+#define JPEG_YIELD_EVERY_ROWS  32
 
 /* 帧率策略: LCD 本地预览降频, 把 CPU 让给远程视频流 */
 #define LCD_PREVIEW_MS   200   /* LCD 预览间隔 (约 2 fps) */
@@ -84,6 +134,15 @@ static const char *TAG = "kanhu";
  *     说明帧缓冲在绘制过程中被摄像头 DMA 改写了 —— 这就是花屏的根因。
  */
 #define LCD_SELFTEST_ONLY   0
+
+/* ---------------- 音频调试开关 ----------------
+ *
+ * AUDIO_SELFTONE = 1: 开机自动循环播 440Hz 测试音 (3 秒一轮),
+ *   用来确认喇叭链路通不通。已实测通过 (麦克风能拾到回授,
+ *   rms 随响/停周期跳动), 现在置 0 恢复正常状态。
+ *   需要复测时改成 1 重新烧录即可。
+ */
+#define AUDIO_SELFTONE      0
 
 /* ---------------- 全局状态 ---------------- */
 
@@ -104,6 +163,39 @@ static uint32_t             s_frame_count = 0;
 
 /* 前置声明: 编码函数定义在生产者任务之后 */
 static size_t encode_jpeg_to_slot(const uint8_t *rgb565, int w, int h, uint8_t *dst);
+
+/*
+ * 应用任务统一绑定的 CPU 核。
+ *
+ * 这是修【闪花屏】的关键一环, 原理:
+ *
+ *   ESP32-S3 的 PSRAM 数据缓存是【每核独立】的
+ *   (IDF 源码 cache_ll.h 里写得很清楚:
+ *    "Both cores have their own DBUS0" / "Both cores have their own IBUS0")
+ *   也就是说 core 0 和 core 1 各有一份 PSRAM 缓存副本。
+ *
+ *   esp32-camera 的 cam_task 被 CONFIG_CAMERA_CORE0=y 钉在 core 0,
+ *   它取到帧之后会调用 cam_drop_psram_cache() 失效缓存 ——
+ *   但那个操作【只对当前核(core 0)有效】!
+ *
+ *   如果我们的任务跑在 core 1 上:
+ *     core 1 的缓存里还留着【上一次】读到的 PSRAM 旧数据
+ *     -> 我们读到的是陈旧/撕裂的帧 -> 屏幕花屏
+ *
+ *   这正好解释了之前的现象:
+ *     【浏览器 MJPEG 干净, 但 LCD 花屏】
+ *     因为 httpd 任务和 lcd 任务被调度到了不同的核。
+ *
+ * 修复: 把所有碰 PSRAM 帧数据的任务全部钉到 core 0,
+ *       保证它们和 cam_task 看到同一份缓存。
+ *
+ * 【2026-11-03】这个常量现在定义在 audio_board.h 里 (音频环形缓冲也在
+ * PSRAM, 有同样的跨核缓存一致性问题), main.c 和 audio_board.c 共用一份,
+ * 免得两边写成不同的核号。
+ */
+#ifndef APP_CORE_ID
+#define APP_CORE_ID        0
+#endif
 
 /*
  * 摄像头只有一个, 但有两个消费者: LCD 本地预览 + 远程 MJPEG 视频流。
@@ -157,6 +249,732 @@ static volatile uint32_t s_cam_get_us = 0;      /* 最近一次取帧耗时 */
 static volatile uint32_t s_rgb_copy_us = 0;     /* 最近一次 RGB565 拷贝耗时 */
 static volatile uint32_t s_torn_frames = 0;     /* 拷贝过程中被 DMA 改写的帧数 */
 static volatile uint32_t s_clean_frames = 0;    /* 拷贝期间保持完好的帧数 */
+static volatile uint32_t s_lcd_direct_frames = 0; /* 直绘模式的帧数 */
+static volatile uint32_t s_lcd_draw_us = 0;      /* 最近一次直绘耗时 */
+
+/*
+ * 【花屏量化指标】—— 固件侧直接算出"这帧有多脏"。
+ *
+ * 背景: 之前一直在电脑上分析 JPEG 找花屏, 但 JPEG 会把噪点平滑掉,
+ * 而且 /raw 抓帧还被一个开关 gate 住 (抓到的其实是旧帧),
+ * 导致分析结论全部作废。现在把这个指标做进固件, 任何时候
+ * 串口发一条命令就能看到数字, 不用猜、不用人眼看屏幕。
+ *
+ * 指标定义 (对原始 RGB565, 采样 30 行):
+ *   hi_energy / lo_energy = 相邻像素平均绝对差 (0~255)
+ *       干净画面 < 3; 花屏时几十甚至上百。
+ *   hi_jumps / lo_jumps = 相邻差 > 16 的像素对个数
+ *   bad_rows = 能量超过阈值 (NOISE_BAD_ENERGY) 的行数
+ *
+ * 关键判据: 同一个场景下, 数值【越小越干净】。
+ */
+static volatile uint32_t s_hi_energy = 0;   /* 高字节相邻差均值 * 100 */
+static volatile uint32_t s_lo_energy = 0;   /* 低字节相邻差均值 * 100 */
+static volatile uint32_t s_hi_jumps = 0;
+static volatile uint32_t s_lo_jumps = 0;
+static volatile uint32_t s_bad_rows = 0;    /* 脏行数 (0~30) */
+static volatile uint32_t s_qual_frames = 0; /* 参与统计的帧数 */
+
+/*
+ * 【逐通道质量指标】—— 这才是能真正反映"花屏"的指标。
+ *
+ * 为什么旧的 hi/lo_energy 指标是废的:
+ *   旧指标直接算【原始字节】的相邻差。RGB565 的两个字节各自承载
+ *   不同位域:
+ *     高字节 = R5(bit15..11) | G3(bit10..8)
+ *     低字节 = G2(bit7..5)   | B5(bit4..0)
+ *   两个像素相邻时, 只要绿色跳 1, 字节差就会突然出现 32 的台阶
+ *   (因为 G2 跨过了 bit 边界), 于是"平均字节差"被这个位域边界效应
+ *   主导 —— 实测低字节能量 53.9 里有 32 就是这么来的, 是伪像。
+ *
+ * 正确的做法: 先【按位域拆开】, 再在每个通道内部算相邻差。
+ *
+ * 拆分后实测 (raw3_1.bin):
+ *     R5 (hi>>3)   相邻差均值 1.02   自相关 0.957  -> 干净
+ *     G3 (hi&7)    相邻差均值 0.27   自相关 0.947  -> 干净
+ *     G2 (lo>>5)   相邻差均值 1.57   自相关 0.391  -> 【随机噪声】
+ *     B5 (lo&31)   相邻差均值 1.01   自相关 0.968  -> 干净
+ *
+ * 而 G2 (绿色的低 3 位) 正是 ESP32-S3 硬件 YUV->RGB 转换器输出的
+ * 那个字段, 它每帧重新随机 (帧间自相关 0.02), 熵 3.00 bit (均匀分布),
+ * 且与其它通道完全不相关 (corr(G2,R5) = -0.00)。
+ * 这就是花屏的真正来源: 【转换器的绿色低位是垃圾】。
+ *
+ * 新指标 s_g2_bad_pct:
+ *   统计【绿色低 3 位】相邻像素的"中值残差" > 3 的像素占比。
+ *   干净画面 0.0%; 现在的花屏状态 11~20%。
+ *   这是一个和"位域边界"无关的真指标, 可以直接用来判定修好没有。
+ */
+static volatile uint32_t s_g2_bad_pct = 0;   /* 绿色低位坏点占比 (0~10000 => 0.00~100.00%) */
+static volatile uint32_t s_g2_energy = 0;    /* 绿色低位相邻差均值 * 100 */
+static volatile uint32_t s_r5_energy = 0;   /* 红色 5 位相邻差均值 * 100 */
+static volatile uint32_t s_b5_energy = 0;   /* 蓝色 5 位相邻差均值 * 100 */
+
+/*
+ * 【缓冲稳定性测试】—— 决定性实验: 帧缓冲会不会被 DMA 偷偷改写。
+ *
+ * 做法: 在生产者手里对同一块帧缓冲算两次哈希, 中间隔 250ms
+ *       (这段时间摄像头已经转了 5~6 帧, 足够 DMA 覆盖这块缓冲)。
+ *
+ * 判读:
+ *   两次哈希【不同】 -> 帧缓冲在我们【还拿着它的时候】就被 DMA 改写了。
+ *                        这是"撕裂/花屏"的经典成因:
+ *                        摄像头有 fb_count 个缓冲, GRAB_LATEST 模式下
+ *                        队列里始终是最新帧, 我们拿到手的帧随时可能被
+ *                        下一帧的 DMA 覆盖 —— 而我们正在把它画到屏幕上。
+ *   两次哈希【相同】 -> 帧缓冲是稳定的, 噪声来自【数据本身】,
+ *                        即传感器/DVP 链路的电气或格式问题。
+ */
+static volatile uint32_t s_hash_test_a = 0;
+static volatile uint32_t s_hash_test_b = 0;
+static volatile bool    s_hash_test_armed = false;
+
+/* FNV-1a 32 位哈希, 快速且够用 */
+static uint32_t buf_hash(const uint8_t *buf, size_t len)
+{
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        h ^= buf[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/*
+ * 原始 RGB565 帧快照 —— 取证用。
+ *
+ * 把最近一帧的【原始 RGB565】原样存下来 (不做任何 JPEG 编码),
+ * 通过 /raw 端点导出到电脑, 这样就能在电脑上逐字节分析:
+ *   - 到底哪些字节被污染
+ *   - 是整行错位还是逐像素跳变
+ *   - 是不是"半个像素"的错位 (低字节被上一行的高字节顶掉)
+ *
+ * 之前只能看 JPEG, 而 JPEG 会把噪点平滑掉, 根本看不出真相。
+ */
+#define RAW_SNAPSHOT_BYTES (320 * 240 * 2)
+static uint8_t *s_raw_snapshot = NULL;      /* PSRAM, 原始 RGB565 */
+static volatile uint32_t s_raw_snapshot_seq = 0;   /* 每存一次 +1 */
+static volatile uint32_t s_raw_snapshot_ready = 0; /* 存了几份 */
+
+/* 供 measure_bytes 等使用的原始 RGB565 缓冲 */
+
+/*
+ * 原始 RGB565 帧的"噪点"统计 —— 定位花屏的第一手数字。
+ *
+ * 怎么算:
+ *   摄像头帧是 RGB565 (大端)。相邻两个像素的差值取平均, 就是这一行的
+ *   "纹理能量"。干净画面相邻像素差很小 (渐变), 被污染的行会有大量
+ *   大跳变 -> 能量飙升。
+ *
+ *   报告两个指标:
+ *     jumps  = 差值 > 阈值的像素对个数 (阈值取满量程的 1/16)
+ *     energy = 相邻像素平均绝对差 (0~65535)
+ *
+ * 为什么要在固件里算 (而不是在电脑上算 JPEG):
+ *   JPEG 编码会把噪点平滑掉, 看起来就不明显;
+ *   而 LCD 显示的是【原始 RGB565】, 噪点会原形毕露。
+ *
+ * 自校准:
+ *   同一套指标也用来测【程序生成的合成图】(一定是干净的)。
+ *   拿两者对比, 就能确定噪声到底来自摄像头还是来自显示链路 ——
+ *   不用靠肉眼猜。
+ */
+#define NOISE_PROBE_ROWS   30
+#define NOISE_JUMP_THRESH  0x1000   /* RGB565 差值 > 4096 算一次大跳变 */
+
+typedef struct {
+    uint32_t jumps;    /* 大跳变个数 (累计) */
+    uint32_t energy;   /* 相邻像素平均绝对差 (累计, 已除以像素对数) */
+    uint32_t samples;  /* 采样了多少行 */
+} noise_stat_t;
+
+/*
+ * 高/低字节分别测量 —— 定位污染到底落在哪一半字节上。
+ *
+ * RGB565 大端存放: 像素 = (hi << 8) | lo
+ *   hi = R5 G3   (颜色信息的主要部分)
+ *   lo = G2 B5   (颜色的低位)
+ *
+ * 如果噪点只污染 lo, 说明 DMA 写的是"半个像素"的错位;
+ * 如果 hi 也脏, 说明整行都乱了。
+ */
+typedef struct {
+    uint32_t hi_energy;   /* 高字节相邻差的平均 */
+    uint32_t lo_energy;   /* 低字节相邻差的平均 */
+    uint32_t hi_jumps;    /* 高字节大跳变数 */
+    uint32_t lo_jumps;    /* 低字节大跳变数 */
+} byte_stat_t;
+
+static void measure_bytes(const uint8_t *buf, int width, int height, byte_stat_t *out)
+{
+    uint32_t hi_sum = 0, lo_sum = 0, hi_j = 0, lo_j = 0, rows = 0;
+
+    int step = height / NOISE_PROBE_ROWS;
+    if (step < 1) {
+        step = 1;
+    }
+
+    for (int y = 0; y < height; y += step) {
+        const uint8_t *row = buf + (size_t)y * width * 2;
+        uint8_t ph = row[0], pl = row[1];
+        uint32_t rs_h = 0, rs_l = 0, rj_h = 0, rj_l = 0;
+
+        for (int x = 1; x < width; x++) {
+            uint8_t h = row[x * 2];
+            uint8_t l = row[x * 2 + 1];
+            uint32_t dh = (h > ph) ? (h - ph) : (ph - h);
+            uint32_t dl = (l > pl) ? (l - pl) : (pl - l);
+            rs_h += dh;
+            rs_l += dl;
+            if (dh > 16) rj_h++;
+            if (dl > 16) rj_l++;
+            ph = h;
+            pl = l;
+        }
+
+        hi_sum += rs_h / (uint32_t)(width - 1);
+        lo_sum += rs_l / (uint32_t)(width - 1);
+        hi_j += rj_h;
+        lo_j += rj_l;
+        rows++;
+    }
+
+    out->hi_energy = rows ? (hi_sum / rows) : 0;
+    out->lo_energy = rows ? (lo_sum / rows) : 0;
+    out->hi_jumps = hi_j;
+    out->lo_jumps = lo_j;
+}
+
+static byte_stat_t s_bytes = {0, 0, 0, 0};
+
+/*
+ * 【新增】量化一帧的"脏程度" —— 固件侧指标, 用来客观判断花屏修没修好。
+ *
+ * 与 measure_bytes 的区别:
+ *   measure_bytes 是累计型的 (统计跳变/能量), 给的是"这一帧有多少跳变";
+ *   这里是"一行一个能量值", 顺便数出有多少行是脏的 (bad_rows),
+ *   这样能区分:
+ *     - 全屏均匀噪点  -> bad_rows 高
+ *     - 局部花带      -> bad_rows 低但有值
+ *
+ * 阈值 NOISE_BAD_ENERGY 取 12 (相邻像素平均绝对差):
+ *   干净的自然画面, 相邻像素差一般在 1~3;
+ *   花屏的行会飙到 30 以上。
+ */
+#define NOISE_BAD_ENERGY  12
+
+typedef struct {
+    uint32_t hi_energy;   /* 高字节相邻差均值 * 100 */
+    uint32_t lo_energy;   /* 低字节相邻差均值 * 100 */
+    uint32_t hi_jumps;
+    uint32_t lo_jumps;
+    uint32_t bad_rows;
+    uint32_t rows;
+} quality_stat_t;
+
+static void measure_quality(const uint8_t *buf, int width, int height,
+                            quality_stat_t *out)
+{
+    uint32_t hi_sum = 0, lo_sum = 0, hi_j = 0, lo_j = 0, rows = 0, bad = 0;
+
+    int step = height / NOISE_PROBE_ROWS;
+    if (step < 1) {
+        step = 1;
+    }
+
+    for (int y = 0; y < height; y += step) {
+        const uint8_t *row = buf + (size_t)y * width * 2;
+        uint8_t ph = row[0], pl = row[1];
+        uint32_t rs_h = 0, rs_l = 0, rj_h = 0, rj_l = 0;
+
+        for (int x = 1; x < width; x++) {
+            uint8_t h = row[x * 2];
+            uint8_t l = row[x * 2 + 1];
+            uint32_t dh = (h > ph) ? (uint32_t)(h - ph) : (uint32_t)(ph - h);
+            uint32_t dl = (l > pl) ? (uint32_t)(l - pl) : (uint32_t)(pl - l);
+            rs_h += dh;
+            rs_l += dl;
+            if (dh > 16) rj_h++;
+            if (dl > 16) rj_l++;
+            ph = h;
+            pl = l;
+        }
+
+        uint32_t eh = rs_h / (uint32_t)(width - 1);
+        uint32_t el = rs_l / (uint32_t)(width - 1);
+        hi_sum += eh;
+        lo_sum += el;
+        hi_j += rj_h;
+        lo_j += rj_l;
+        /* 一行只要高/低字节里有一个很脏, 就算脏行 */
+        if (eh > NOISE_BAD_ENERGY || el > NOISE_BAD_ENERGY) {
+            bad++;
+        }
+        rows++;
+    }
+
+    out->hi_energy = rows ? (hi_sum / rows) * 100 : 0;
+    out->lo_energy = rows ? (lo_sum / rows) * 100 : 0;
+    out->hi_jumps = hi_j;
+    out->lo_jumps = lo_j;
+    out->bad_rows = bad;
+    out->rows = rows;
+}
+
+/*
+ * 【逐通道质量指标】measure_channel_quality()
+ *
+ * 把 RGB565 按位域拆开, 在【每个通道内部】算相邻差和中值残差,
+ * 彻底避开"跨位域边界"的伪像。
+ *
+ * 关注的是 G2 (绿色低 3 位, = 低字节的 bit7..5):
+ *   ESP32-S3 硬件 YUV->RGB 转换器输出的绿色低位是垃圾,
+ *   而人眼对绿色最敏感, 所以它单独一个字段就能毁掉整幅画面。
+ *
+ * 判定标准 (实测标定):
+ *   干净画面   : g2_bad_pct < 1%     (实测 0.00%)
+ *   当前花屏状态: g2_bad_pct 11~20%  (实测 11.48% / 12.68% / 15.75% / 19.42%)
+ *
+ * 中值残差 (而不是简单的相邻差) 更稳健:
+ *   |G2[x] - median(G2[x-1], G2[x+1])| > 3
+ * 对真正随机的 G2 会稳定命中, 对平滑渐变则完全不命中。
+ */
+#define CHAN_G2_BAD_THR   3    /* 中值残差阈值 (0~7) */
+
+typedef struct {
+    uint32_t g2_bad_pct;   /* 绿色低位坏点占比 * 100 (0~10000) */
+    uint32_t g2_energy;    /* 绿色低位相邻差均值 * 100 */
+    uint32_t r5_energy;    /* 红色 5 位相邻差均值 * 100 */
+    uint32_t b5_energy;    /* 蓝色 5 位相邻差均值 * 100 */
+} chan_stat_t;
+
+static void measure_channel_quality(const uint8_t *buf, int width, int height,
+                                    chan_stat_t *out)
+{
+    /* 采样若干行, 累加各通道的相邻差 */
+    uint32_t g2_sum = 0, r5_sum = 0, b5_sum = 0, pairs = 0;
+    uint32_t g2_bad = 0, total = 0;
+
+    int step = height / NOISE_PROBE_ROWS;
+    if (step < 1) {
+        step = 1;
+    }
+
+    for (int y = 0; y < height; y += step) {
+        const uint8_t *row = buf + (size_t)y * width * 2;
+
+        uint8_t p_g2 = (uint8_t)((row[1] >> 5) & 7);
+        uint8_t p_r5 = (uint8_t)((row[0] >> 3) & 0x1F);
+        uint8_t p_b5 = (uint8_t)(row[1] & 0x1F);
+        uint8_t prev_g2 = p_g2;
+
+        for (int x = 1; x < width; x++) {
+            const uint8_t *px = row + (size_t)x * 2;
+            uint8_t g2 = (uint8_t)((px[1] >> 5) & 7);
+            uint8_t r5 = (uint8_t)((px[0] >> 3) & 0x1F);
+            uint8_t b5 = (uint8_t)(px[1] & 0x1F);
+
+            g2_sum += (g2 > prev_g2) ? (g2 - prev_g2) : (prev_g2 - g2);
+            r5_sum += (r5 > p_r5) ? (r5 - p_r5) : (p_r5 - r5);
+            b5_sum += (b5 > p_b5) ? (b5 - p_b5) : (p_b5 - b5);
+
+            /*
+             * 中值残差: 用左右邻居的中值当"应该是多少",
+             * 差得多就说明这一格是【离群点】(噪声), 而不是平滑过渡。
+             *
+             *   resid(x) = |G2[x] - median(G2[x-1], G2[x+1])|
+             *
+             * 对真正随机的 G2 会稳定命中, 对平滑渐变则完全不命中。
+             */
+            if (x >= 2 && x + 1 < width) {
+                uint8_t left  = (uint8_t)((row[(size_t)(x - 1) * 2 + 1] >> 5) & 7);
+                uint8_t right = (uint8_t)((row[(size_t)(x + 1) * 2 + 1] >> 5) & 7);
+                uint8_t expect = (uint8_t)((left + right) / 2);
+                uint8_t resid = (g2 > expect) ? (uint8_t)(g2 - expect)
+                                              : (uint8_t)(expect - g2);
+                if (resid > CHAN_G2_BAD_THR) {
+                    g2_bad++;
+                }
+            }
+            total++;
+
+            prev_g2 = g2;
+            p_r5 = r5;
+            p_b5 = b5;
+        }
+        pairs += (uint32_t)(width - 1);
+    }
+
+    /*
+     * 注意: 必须【先乘 100 再除】。
+     * 如果写成 (g2_sum / pairs) * 100, 整数除法会先把均值截断成 0,
+     * 再乘 100 还是 0 —— 均值小于 1 时就永远显示 0.00。
+     */
+    out->g2_energy = pairs ? (g2_sum * 100u) / pairs : 0;
+    out->r5_energy = pairs ? (r5_sum * 100u) / pairs : 0;
+    out->b5_energy = pairs ? (b5_sum * 100u) / pairs : 0;
+    out->g2_bad_pct = total ? (g2_bad * 10000u) / total : 0;
+}
+
+/*
+ * 【软件修复绿色低位】repair_green_low()
+ *
+ * 就地修掉 RGB565 里的 G2 字段 (低字节的 bit7..5 = 绿色的低 3 位)。
+ *
+ * 为什么这样做是合理的:
+ *   实测 G3 (绿色高 3 位) 干净 (中值残差 > 3 只有 0.01%~1.9%),
+ *   G2 (绿色低 3 位) 是随机噪声 (11%~20%)。
+ *   也就是说: 我们【知道】每个像素的绿色落在哪个 8 分之一区间 (G3),
+ *   但区间内的精确值 (G2) 是垃圾。
+ *
+ * 修法: 用【同一行左右邻居的中值】填回 G2。
+ *   - 对真噪声: 邻居的中值几乎不可能等于这个随机值 -> 被替换掉;
+ *   - 对真渐变: 邻居中值 ≈ 真实值 -> 几乎不改。
+ *   所以这是【只降噪、不损伤细节】的操作。
+ *
+ * 注意 G3 与 G2 的关系: 真实的绿色 = (G3<<3) | G2, 落在
+ * [G3*8, G3*8+7] 这个 8 步长的区间里。用邻居的中值时, 我们还要
+ * 把中值夹到 G3 决定的区间内, 否则会破坏 G3 表达的量级。
+ *
+ * 逐行处理, 每行独立 (行的边界用行内邻居)。
+ */
+static void repair_green_low(uint8_t *buf, int width, int height)
+{
+    for (int y = 0; y < height; y++) {
+        uint8_t *row = buf + (size_t)y * width * 2;
+
+        /* 先把整行的 G2 取出来 (顺便记下 G3) */
+        for (int x = 0; x < width; x++) {
+            uint8_t *px = row + (size_t)x * 2;
+            uint8_t g3 = (uint8_t)((px[0] >> 3) & 0x07);
+            uint8_t g2 = (uint8_t)((px[1] >> 5) & 0x07);
+
+            uint8_t new_g2 = g2;
+            if (x >= 1 && x + 1 < width) {
+                uint8_t l_g3 = (uint8_t)((row[(size_t)(x - 1) * 2] >> 3) & 0x07);
+                uint8_t l_g2 = (uint8_t)((row[(size_t)(x - 1) * 2 + 1] >> 5) & 0x07);
+                uint8_t r_g3 = (uint8_t)((row[(size_t)(x + 1) * 2] >> 3) & 0x07);
+                uint8_t r_g2 = (uint8_t)((row[(size_t)(x + 1) * 2 + 1] >> 5) & 0x07);
+
+                /* 邻居的低位, 先各自夹到各自 G3 的区间里 */
+                uint8_t l_eff = (uint8_t)(l_g3 * 8 + l_g2);
+                uint8_t r_eff = (uint8_t)(r_g3 * 8 + r_g2);
+                uint8_t mid = (uint8_t)((l_eff + r_eff) / 2);
+
+                /* 再夹回本像素 G3 决定的区间 [g3*8, g3*8+7] */
+                uint8_t lo = (uint8_t)(g3 * 8);
+                uint8_t hi = (uint8_t)(g3 * 8 + 7);
+                if (mid < lo) mid = lo;
+                if (mid > hi) mid = hi;
+                new_g2 = (uint8_t)(mid & 0x07);
+            } else {
+                /* 行首/行尾: 退化成用 G3 的区间中点 (不引入新噪声) */
+                new_g2 = 4;
+            }
+            px[1] = (uint8_t)((px[1] & 0x1F) | (new_g2 << 5));
+        }
+    }
+}
+
+/* ===========================================================================
+ * 【软件亮度稳定器】—— 解决 GC0308 自动曝光的周期性震荡 (画面闪烁)
+ * ---------------------------------------------------------------------------
+ * 【问题现象】
+ *   画面亮度在 11000 ~ 27000 之间来回跳, 周期 8 秒, 三档 (0xd4 = 0x0B/0x18/0x1D)。
+ *   用户看到的就是"忽明忽暗", 主观上就是"闪烁"。
+ *
+ * 【取证链 (全部实测, 不是猜测)】
+ *   1. 全寄存器扫描 (page0/1/2/3, 0x00-0xff) 对比多帧快照:
+ *      唯一在变的是 0xd4 -> 0x18/0x1D/0x0B, 周期 8 秒。
+ *   2. 0xd4 与画面亮度严格对应 (Pearson = 0.89):
+ *      0xd4=0x0B -> 平均亮度 14349;  0xd4=0x1D -> 平均亮度 28885。
+ *   3. 传感器【内置彩条】亮度稳定 (幅度 4%), 只有真实场景在跳
+ *      -> 确认是 AE 根据场景画面来回调, 不是数据链路坏。
+ *   4. 尝试关掉 AEC/AGC (0x22 各种取值, 含逐 bit 清零)、改 AEC 目标 (0xd3)、
+ *      设 min/max 积分时间与增益上下限 (0x53-0x59)、改 PCLK 分频 ——
+ *      【全部无效】。GC0308 的 AE 没有暴露可写的"关掉"开关,
+ *      判决值只写在一字节的 0xd4 里, 而写 0xd4 会被传感器立刻改回去。
+ *
+ * 【结论】
+ *   硬件层面关不掉这个震荡, 所以在【软件层】把它抵消掉。
+ *
+ * 【做法】
+ *   每帧算一个亮度基准 (取样若干行的平均值), 和"参考亮度"比较,
+ *   然后按比例把 RGB565 每个通道缩放到参考亮度附近。
+ *
+ *   关键点: 缩放的是【每个通道的位值】, 所以画面结构和颜色关系都保留,
+ *   只是整体明暗被拉回一致 —— 这正好抵消 AE 的震荡。
+ *
+ * 【为什么这样安全】
+ *   - 只在"亮度偏离参考值超过阈值"时才动手 (±8% 以内不处理), 避免把
+ *     正常的场景亮度变化也抹掉。
+ *   - 缩放系数被限制在 [0.6, 1.6], 防止极端情况把画面弄黑或烧白。
+ *   - 参考亮度本身做慢速跟随 (每帧只朝目标移动 1/16), 这样环境光真的
+ *     变了 (比如开灯/关灯) 时画面还是会缓慢适应, 只是不会一帧亮一帧暗。
+ *   - 逐像素处理, 320x240 = 76800 像素, 用整数运算, 一次扫描即可。
+ */
+#define BRIGHT_STAB_ENABLE     1
+#define BRIGHT_STAB_TARGET     26000u   /* 参考亮度 (0..65535) */
+/*
+ * 缩放上下限。
+ *
+ * 必须覆盖 AE 的完整调节范围: 实测 AE 把帧亮度在 11000 ~ 27000 之间拉,
+ * 所以要把 11000 拉到 26000 需要 scale = 2.36, 而把 27000 拉下来只需要 0.96。
+ * 下限设 0.85 / 上限设 2.60, 保证【任何一帧都能被拉到目标附近】。
+ * (早先上限只有 1.80, 结果暗帧拉不上去, 亮度就在两个台阶之间跳。)
+ */
+#define BRIGHT_STAB_MIN_SCALE  0.85f   /* 缩放下限 */
+#define BRIGHT_STAB_MAX_SCALE  2.60f   /* 缩放上限 */
+/*
+ * 参考亮度的跟随速度。
+ *
+ * 必须【比 AE 的震荡周期慢得多】: AE 周期是 8 秒, 这里的时间常数约 30 秒,
+ * 所以 8 秒周期内的明暗起伏会被平均掉, 参考亮度保持稳定。
+ * 同时, 环境光真的变了 (开灯/关灯, 几分钟尺度), 参考亮度还是会慢慢跟上。
+ */
+#define BRIGHT_STAB_ADAPT      0.0042f  /* 1/240 -> 8fps 下约 30 秒时间常数 */
+
+static volatile bool s_bright_stab = (BRIGHT_STAB_ENABLE != 0);
+static volatile float s_bright_ref = (float)BRIGHT_STAB_TARGET;
+static volatile uint32_t s_bright_adjust_count = 0;   /* 调整过的帧数 */
+static volatile uint32_t s_bright_last_scale_pct = 100; /* 最近一次的缩放百分比 */
+
+/*
+ * 估算一帧的平均亮度 (0..65535)。
+ *
+ * 【量纲必须和 BRIGHT_STAB_TARGET 一致】
+ * 这里直接取 RGB565 16bit 像素值的平均, 也就是"把整帧当成 16bit 灰度"的
+ * 平均值。这样 BRIGHT_STAB_TARGET=26000 就对应"整帧平均 26000/65535 = 40%"
+ * 的画面, 和在电脑上分析 rawdump 的结果可以直接对照。
+ *
+ * (早先版本用的是 (r*77+g*151+b*28)*32, 量纲比这个大 32 倍,
+ *  导致缩放系数一直被夹在下限, 画面反而越调越暗。)
+ *
+ * 为了省时间, 只采样一部分行 (每隔 step 行采一行), 但每行全采 ——
+ * 320 个像素足够稳定, 而且行间亮度分布的变化也能被采到。
+ */
+static uint32_t estimate_frame_luma(const uint8_t *buf, int width, int height)
+{
+    uint64_t sum = 0;
+    uint32_t count = 0;
+    int step = (height > 32) ? 4 : 1;
+
+    for (int y = 0; y < height; y += step) {
+        const uint8_t *row = buf + (size_t)y * width * 2;
+        for (int x = 0; x < width; x++) {
+            sum += (uint32_t)((row[x * 2] << 8) | row[x * 2 + 1]);
+            count++;
+        }
+    }
+    if (count == 0) {
+        return 0;
+    }
+    return (uint32_t)(sum / count);
+}
+
+/*
+ * 把整帧的亮度缩放到目标值。
+ *
+ * 做法: 逐像素取出 RGB565 的三个分量, 分别乘以缩放系数后夹回各自的最大值,
+ * 再重新打包。整数运算, 用定点 (Q8) 表示系数。
+ */
+static void apply_brightness_scale(uint8_t *buf, int width, int height,
+                                   float scale)
+{
+    if (scale <= 0.0f) {
+        return;
+    }
+
+    /* Q8 定点: scale_q8 = scale * 256 */
+    int32_t sq = (int32_t)(scale * 256.0f);
+    if (sq < 1) {
+        sq = 1;
+    }
+
+    for (int y = 0; y < height; y++) {
+        uint8_t *row = buf + (size_t)y * width * 2;
+        for (int x = 0; x < width; x++) {
+            uint16_t p = (uint16_t)((row[x * 2] << 8) | row[x * 2 + 1]);
+            uint32_t r = (p >> 11) & 0x1F;
+            uint32_t g = (p >> 5) & 0x3F;
+            uint32_t b = p & 0x1F;
+
+            r = (uint32_t)(((int32_t)r * sq) >> 8);
+            g = (uint32_t)(((int32_t)g * sq) >> 8);
+            b = (uint32_t)(((int32_t)b * sq) >> 8);
+
+            if (r > 31) r = 31;
+            if (g > 63) g = 63;
+            if (b > 31) b = 31;
+
+            uint16_t out = (uint16_t)((r << 11) | (g << 5) | b);
+            row[x * 2] = (uint8_t)(out >> 8);
+            row[x * 2 + 1] = (uint8_t)(out & 0xFF);
+        }
+    }
+}
+
+/*
+ * 对一帧做亮度稳定处理。
+ *
+ * 返回是否做了调整。
+ *
+ * ---------------------------------------------------------------------------
+ * 【设计: 每帧都归一化到固定的参考亮度】
+ *
+ * 之前的两个版本都失败, 原因分别是:
+ *   a) 带死区 + 参考亮度跟着当前帧走 -> 参考亮度被 AE 带着一起震荡;
+ *   b) 亮度估计的量纲和目标值不一致 (差了 32 倍) -> 缩放系数一直被夹住,
+ *      画面反而越调越暗。
+ *
+ * 现在的做法很直接:
+ *   scale = TARGET / luma, 每一帧都这么算, 输出亮度恒等于 TARGET。
+ *
+ * 这样 AE 的 8 秒周期震荡被【完全抵消】: AE 把画面调暗, 我们就调亮回来。
+ *
+ * 【关于"环境光变化时慢慢适应"】
+ * 本来想让参考亮度缓慢跟随环境, 但那等于给 AE 的震荡开了个口子。
+ * 对"远程看护"这个场景来说, 画面亮度恒定比亮度自适应更重要 ——
+ * 老人看到的一直是同一个亮度, 不会忽然刺眼或忽然看不清。
+ * 所以参考亮度固定, 用 bref 命令可以随时改。
+ */
+static bool stabilize_brightness(uint8_t *buf, int width, int height)
+{
+    if (!s_bright_stab) {
+        return false;
+    }
+
+    uint32_t luma = estimate_frame_luma(buf, width, height);
+    if (luma == 0) {
+        return false;
+    }
+
+    float ref = s_bright_ref;
+    if (ref < 1000.0f) {
+        ref = (float)BRIGHT_STAB_TARGET;
+    }
+
+    /* 缩放系数: 把当前亮度拉到参考亮度 */
+    float scale = ref / (float)luma;
+    if (scale < BRIGHT_STAB_MIN_SCALE) scale = BRIGHT_STAB_MIN_SCALE;
+    if (scale > BRIGHT_STAB_MAX_SCALE) scale = BRIGHT_STAB_MAX_SCALE;
+
+    apply_brightness_scale(buf, width, height, scale);
+
+    s_bright_adjust_count++;
+    s_bright_last_scale_pct = (uint32_t)(scale * 100.0f);
+    return true;
+}
+
+/* 请求抓一帧原始 RGB565 (由 /raw 端点设置) */
+static volatile bool s_raw_capture_requested = false;
+
+/* 请求通过串口导出一帧原始 RGB565 (由 "rawdump" 命令设置) */
+static volatile bool s_raw_dump_requested = false;
+
+static volatile uint32_t s_noise_rows = 0;        /* 最近一帧的噪点行数 */
+static volatile uint32_t s_noise_rows_total = 0;  /* 累计噪点行数 */
+static volatile uint32_t s_noise_frames = 0;      /* 参与统计的帧数 */
+static volatile uint32_t s_noise_jumps = 0;       /* 最近一帧的大跳变数 */
+static volatile uint32_t s_noise_energy = 0;      /* 最近一帧的能量 */
+
+/* 统计一帧 RGB565 的噪声 (采样若干行) */
+static void measure_noise(const uint8_t *buf, int width, int height,
+                          uint32_t *out_jumps, uint32_t *out_energy,
+                          uint32_t *out_noisy_rows)
+{
+    uint32_t jumps = 0;
+    uint32_t energy = 0;
+    uint32_t noisy = 0;
+    uint32_t pairs = 0;
+
+    int step = height / NOISE_PROBE_ROWS;
+    if (step < 1) {
+        step = 1;
+    }
+
+    for (int y = 0; y < height; y += step) {
+        const uint8_t *row = buf + (size_t)y * width * 2;
+        uint32_t row_jumps = 0;
+        uint32_t row_sum = 0;
+
+        uint16_t prev = (uint16_t)((row[0] << 8) | row[1]);
+        for (int x = 1; x < width; x++) {
+            uint16_t cur = (uint16_t)((row[x * 2] << 8) | row[x * 2 + 1]);
+            int diff = (int)cur - (int)prev;
+            if (diff < 0) {
+                diff = -diff;
+            }
+            row_sum += (uint32_t)diff;
+            if (diff > NOISE_JUMP_THRESH) {
+                row_jumps++;
+            }
+            prev = cur;
+        }
+
+        jumps += row_jumps;
+        energy += row_sum / (uint32_t)(width - 1);
+        pairs++;
+        if (row_jumps >= 8) {
+            noisy++;
+        }
+    }
+
+    if (out_jumps)      *out_jumps = jumps;
+    if (out_energy)     *out_energy = pairs ? (energy / pairs) : 0;
+    if (out_noisy_rows) *out_noisy_rows = noisy;
+}
+
+/*
+ * LCD 显示路径开关 (A/B 对照用)
+ *
+ * 【默认值改为 true = 直绘】—— 理由是实测, 不是猜:
+ *
+ *   旧路径 (false): 每 200ms 做一次 153KB 的 PSRAM -> PSRAM memcpy。
+ *   实测耗时 4.9ms, 是一口气连续读完写完的。而就在这 4.9ms 里,
+ *   摄像头的 DVP DMA 正在往 PSRAM 里写【下一帧】。PSRAM 总线是共享的,
+ *   我们这一口气把总线占满, DVP DMA 抢不到带宽, 下一帧就丢数据。
+ *   丢掉的那些行在帧缓冲里是【上一次残留或垃圾】, 画到屏幕上就是一条条花带,
+ *   这正是"闪花屏"的直接来源。
+ *
+ *   直绘 (true): 从摄像头帧缓冲分批画到屏幕, 零 PSRAM->PSRAM 大块拷贝。
+ *   每批画完让出 CPU 给 DVP DMA (lcd_draw_rgb565 里的 vTaskDelay)。
+ *   帧缓冲全程握在手里, 摄像头不会覆盖它 -> 也不会撕裂。
+ *
+ * 两种路径都【不影响】花屏的真正根因 (DVP 写 PSRAM 丢 bit, 见上面的
+ * s_psram_dma_mode 说明), 但直绘能额外去掉一个明显的干扰项,
+ * 让 A/B 对照更干净。
+ */
+static volatile bool s_lcd_direct_draw = true;
+
+/*
+ * 【LCD 显示模式】(运行时可切换, 用串口命令改)
+ *
+ *   MODE_CAMERA  正常: 显示摄像头画面
+ *   MODE_PATTERN 显示固定测试图样 (完全不碰摄像头)
+ *   MODE_SYNTH   显示程序生成的合成渐变图 (走和摄像头一样的 draw_rgb565 路径)
+ *
+ * 为什么要有这个:
+ *   "花屏" 有两种可能, 肉眼分不开:
+ *     A) LCD/SPI 链路本身有问题 (批次边界错位, DMA 复用)
+ *     B) 摄像头数据本身是乱的
+ *   MODE_PATTERN 一开就能一刀切开: 图样也花 = A, 图样正常 = B。
+ *   MODE_SYNTH 再进一步区分"画图代码路径"和"摄像头数据"。
+ *
+ * 【必须声明在 camera_producer_task 之前】
+ *   直绘发生在生产者任务里, 而 lcd1/lcd2 模式发生在 lcd_preview_task 里。
+ *   两者会同时往屏幕画, 所以生产者必须知道自己是不是该让路。
+ */
+typedef enum {
+    LCD_MODE_CAMERA = 0,
+    LCD_MODE_PATTERN = 1,
+    LCD_MODE_SYNTH = 2,
+} lcd_mode_t;
+
+static volatile lcd_mode_t s_lcd_mode = LCD_MODE_CAMERA;
+
+/* 噪点行统计开关 (排障用) */
+static volatile bool s_noise_enabled = false;
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_RECONNECT_BIT  BIT1
@@ -311,6 +1129,32 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     }
 }
 
+/*
+ * 扫描用的 Wi-Fi 初始化: 只把射频打开, 不连任何网络。
+ *
+ * 和 wifi_init() 的区别:
+ *   wifi_init() 会 esp_wifi_set_config + esp_wifi_start, 直接开始连
+ *   —— 之前连不上 5GHz 的 WMU-EDU 就会疯狂重连, 打爆 GDMA 导致花屏。
+ *   这里只 start 不 connect, 射频能扫, 但不会去骚扰任何 AP。
+ */
+static void wifi_scan_init(void)
+{
+    if (s_wifi_events == NULL) {
+        s_wifi_events = xEventGroupCreate();
+    }
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    s_netif = esp_netif_create_default_wifi_sta();
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "Wi-Fi 射频已启动 (仅扫描, 不连接)");
+}
+
 static void wifi_init(void)
 {
     s_wifi_events = xEventGroupCreate();
@@ -367,18 +1211,33 @@ static void wifi_init(void)
     /* ---- STA 模式: 板子连办公室 Wi-Fi ---- */
     s_netif = esp_netif_create_default_wifi_sta();
 
+    /*
+     * 认证方式按密码是否为空自动选。
+     * 之前固定 WPA_WPA2_PSK, 对 OPEN 网络 (2.4GHz 的 WMU-EDU) 会失败。
+     */
+    wifi_auth_mode_t authmode;
+    if (WIFI_PASSWORD[0] == '\0') {
+        authmode = WIFI_AUTH_OPEN;
+    } else {
+        authmode = WIFI_AUTH_WPA_WPA2_PSK;
+    }
+
     wifi_config_t sta_cfg = {
         .sta = {
             .ssid     = WIFI_SSID,
             .password = WIFI_PASSWORD,
-            .threshold.authmode = WIFI_AUTH_WPA_WPA2_PSK,
+            .threshold.authmode = authmode,
+            /* 扫描时也用同一个认证方式, 否则扫不到企业网络的隐藏 SSID */
+            .scan_method = WIFI_ALL_CHANNEL_SCAN,
         },
     };
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "Wi-Fi STA 模式启动中 (SSID=%s)", WIFI_SSID);
+    ESP_LOGI(TAG, "Wi-Fi STA 模式启动中 (SSID=%s, 认证=%s)",
+             WIFI_SSID,
+             authmode == WIFI_AUTH_OPEN ? "OPEN" : "WPA/WPA2");
 #endif
 }
 
@@ -411,6 +1270,41 @@ static void board_i2c_init(void)
     }
     ESP_LOGI(TAG, "共享 I2C 初始化完成 (port=%d, SDA=%d, SCL=%d)",
              (int)BOARD_I2C_PORT, BOARD_I2C_SDA_PIN, BOARD_I2C_SCL_PIN);
+}
+
+/* ---------------- I2C 总线扫描 (找 codec) ----------------
+ *
+ * 目的: 板载音频到底是 ES8311+ES7210 还是 ES8388, 文档说法不一,
+ * 必须靠实测确认 —— 引脚配错会直接和摄像头数据线撞车导致花屏。
+ *
+ * 已知设备 (实测):
+ *   0x18 ES8311 codec, 0x40 ES7210 麦克风 ADC, 0x19 待确认
+ *   0x21 GC0308 摄像头 (SCCB), 0x59 AW9523B IO 扩展器
+ *
+ * 默认关闭 (AUDIO_I2C_SCAN_ENABLE=0), 需要排查硬件接线时才打开。
+ */
+#define AUDIO_I2C_SCAN_ENABLE  0
+
+static void __attribute__((unused)) i2c_scan_audio(void)
+{
+    ESP_LOGI(TAG, "==== I2C 总线扫描 (找音频 codec) ====");
+    uint8_t reg = 0x00;
+    uint8_t val = 0;
+    for (int addr = 0x08; addr <= 0x77; addr++) {
+        /*
+         * 用"读寄存器"方式探测: 先写 1 字节寄存器号, 再读 1 字节。
+         * 0 长度写不可靠 (AW9523B 明明在线却不应答)。
+         */
+        esp_err_t err = i2c_master_write_read_device(BOARD_I2C_PORT, addr,
+                                                     &reg, 1, &val, 1,
+                                                     pdMS_TO_TICKS(20));
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "  I2C 0x%02X 应答 (reg0=%02X)", addr, val);
+        } else if (err != ESP_ERR_TIMEOUT) {
+            ESP_LOGW(TAG, "  I2C 0x%02X 错误: %s", addr, esp_err_to_name(err));
+        }
+    }
+    ESP_LOGI(TAG, "==== 扫描结束 ====");
 }
 
 /* 板载电源使能 + 背光 + 摄像头复位 (走 AW9523B) */
@@ -484,7 +1378,132 @@ static void camera_power_reset(void)
 
 /* ---------------- 摄像头 ---------------- */
 
-/* GC0308 不支持硬件 JPEG，必须用 RGB565 再软件编码 */
+/*
+ * GC0308 不支持硬件 JPEG，必须先拿到 RGB565 再软件编码。
+ *
+ * ==================== 关键: 为什么用 YUV422 + 硬件转换器 ====================
+ *
+ * 之前这里写的是 .pixel_format = PIXFORMAT_RGB565, 结果画面全是花屏噪点。
+ * 根因是【GC0308 实际上并没有按 RGB565 输出】。
+ *
+ * 实测证据 (通过新增的 /raw 端点导出原始帧缓冲, 在电脑上逐字节分析):
+ *
+ *   原始帧缓冲 (153600 字节) 的字节平面统计:
+ *     高字节 (偶数字节) 相邻差 = 55.6
+ *     低字节 (奇数字节) 相邻差 =  7.7
+ *     低字节比高字节平滑 9.7 倍!
+ *
+ *   RGB565 里高字节是 R5+G3、低字节是 G2+B5,
+ *   两个字节承载的信息量相当, 相邻差应该【同数量级】。
+ *   低字节几乎恒定 => 低字节装的不是像素低位, 而是【色度】。
+ *
+ *   按 YUYV(YUV422 交错) 解码验证:
+ *     Y (亮度, 每像素都有)  相邻差 = 45.2  <- 有细节
+ *     U (色度, 两像素共享)  相邻差 =  7.7  <- 平滑
+ *     V (色度, 两像素共享)  相邻差 =  7.7  <- 平滑
+ *   完全符合 YUV422 的特征: 色度是隔行共享的, 所以比亮度平滑得多。
+ *
+ *   把同一帧按两种方式解码并排看:
+ *     当 RGB565 解 -> 红绿噪点 (就是用户看到的花屏)
+ *     按 YUYV 解   -> 清晰正常的画面
+ *
+ * 为什么之前【浏览器里看着还行】?
+ *   JPEG 编码器会把高频噪点平滑掉, 所以流看起来只是"有点脏",
+ *   而 LCD 显示的是原始 RGB565, 噪点原形毕露, 看着就是"一直花屏在闪"。
+ *
+ * 解决方案:
+ *   1) 让 GC0308 输出 YUV422 (它的原生/稳定格式)
+ *   2) 交给 ESP32-S3 的【硬件 YUV->RGB 转换器】处理
+ *      (CONFIG_CAMERA_CONVERTER_ENABLED=y)
+ *      转换在硬件里完成, CPU 零开销 —— 比软件转 YUV->RGB 快得多。
+ *
+ * 注意:
+ *   - pixel_format 必须写成 PIXFORMAT_YUV422 (这是【传感器输出】格式)
+ *   - conv_mode  = YUV422_TO_RGB565 (这是【转换器输出】格式)
+ *   - 这样 esp_camera_fb_get() 拿到的就是真正的 RGB565,
+ *     后面 JPEG 编码和 LCD 显示都不用改。
+ */
+/*
+ * 【转换器开关】用不用 S3 的硬件 YUV->RGB 转换器。
+ *
+ * 这是一个必须用数据回答的问题, 因为两种配置各有各的问题:
+ *
+ *   用转换器 (conv_mode = YUV422_TO_RGB565):
+ *     传感器输出 YUV422 -> 硬件转成 RGB565。
+ *     优点: CPU 零开销。
+ *     风险: 实测出来的现象是 "lo 字节极脏 (能量 37)、hi 字节干净 (能量 3)",
+ *           而转换器输出是 RGB565, 两个字节承载的信息量应该相当 ——
+ *           这个巨大的不对称【不正常】, 怀疑转换器根本没真正生效,
+ *           我们拿到的还是原始 YUV422, 只是被当成 RGB565 解释了。
+ *
+ *   不用转换器 (pixel_format = RGB565):
+ *     传感器直接输出 RGB565 (GC0308 支持, 见 gc0308.c 的 set_pixformat)。
+ *     优点: 路径最短, 没有转换环节, 排除转换器的嫌疑。
+ *     风险: RGB565 是 2 字节/像素, DVP 带宽需求和 YUV422 一样, 无所谓。
+ *
+ * 所以做成运行时开关, 用固件的 bad_rows 指标客观地选。
+ */
+static volatile bool s_use_converter = true;
+
+/*
+ * 【摄像头重配置的安全锁】
+ *
+ * 之前 `conv 0` 命令会直接调用 esp_camera_deinit(), 而那时候
+ * camera_producer_task 正在 esp_camera_fb_get() 里 —— 两者并发,
+ * 立刻 RTC_SW_CPU_RST 复位, 板子重启, 转换器又变回默认的"开"。
+ *
+ * 正确做法:
+ *   1) 生产者每轮循环检查 s_cam_pause, 看到就【把帧还回去并退出循环】
+ *      (在 esp_camera_fb_get() 之前检查, 保证不会握着帧时被打断);
+ *   2) 重配置时先置 s_cam_pause, 等生产者确认已退出 (s_cam_paused=1),
+ *      再做 deinit/init;
+ *   3) 完成后清 s_cam_pause, 生产者自动恢复。
+ */
+static volatile bool s_cam_pause = false;    /* 请求生产者暂停 */
+static volatile bool s_cam_paused = false;   /* 生产者已确认暂停 */
+
+/*
+ * 【软件修复绿色低位】—— 万一硬件转换器的绿色低位确实是坏的,
+ * 我们可以在【显示/编码之前】把 G2 字段替换成推算值。
+ *
+ * 原理: RGB565 里绿色 = G3(高3位) | G2(低3位)。G3 是干净的,
+ * 所以只要把低 3 位按【邻域中值】填回, 就能去掉随机噪声。
+ * 实测: G3 的中值残差 > 3 的占比只有 0.01%~1.9%, 而 G2 是 11%~20%。
+ * 也就是说 G3 可以直接当"绿色高位的可信值", 而绿色低位的可信度极低。
+ *
+ * 代价: 需要一帧的额外处理 (逐像素中值滤波), CPU 开销约几 ms。
+ * 好处: 立刻消除"绿色闪烁"这个最刺眼的症状。
+ *
+ * s_green_fix = false 时完全不启用 (零开销)。
+ */
+static volatile bool s_green_fix = false;
+
+/*
+ * 【传感器输出模式】三选一, 用来做决定性的 A/B 实验。
+ *
+ *   MODE_CONV_RGB565 (0): 传感器出 YUV422 -> 硬件转换器 -> RGB565 (2字节/像素)
+ *   MODE_RAW_RGB565  (1): 传感器直接出 RGB565, 不走转换器 (2字节/像素)
+ *   MODE_GRAYSCALE   (2): 传感器出 8 位灰度 (1字节/像素)
+ *
+ * 为什么需要 GRAYSCALE:
+ *   这是【最干净的探针】。灰度模式下:
+ *     - 没有位域打包 (每像素就是 1 个字节, 没有 RGB565 的 5/6/5 拆分)
+ *     - 不经过硬件转换器 (转换器是最大的嫌疑对象)
+ *     - DVP 带宽需求减半 (24MHz 下省很多)
+ *   如果灰度模式【完全干净】, 就证明 DVP 链路本身是好的,
+ *   问题出在 "16 位打包 + 转换器" 这一环;
+ *   如果灰度模式【也花屏】, 就证明是 DVP/PSRAM DMA 层面的问题,
+ *   与格式和转换器无关。
+ *
+ * 这三种模式共用同一条 DVP 链路, 所以这是一次干净的对照实验。
+ */
+#define SENSOR_MODE_CONV_RGB565  0
+#define SENSOR_MODE_RAW_RGB565   1
+#define SENSOR_MODE_GRAYSCALE    2
+#define SENSOR_MODE_RAW_YUV422   3
+
+static volatile int s_sensor_mode = SENSOR_MODE_CONV_RGB565;
+
 static camera_config_t camera_config = {
     .pin_pwdn  = CAM_PIN_PWDN,
     .pin_reset = CAM_PIN_RESET,
@@ -508,7 +1527,16 @@ static camera_config_t camera_config = {
     .ledc_timer   = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
 
-    .pixel_format = PIXFORMAT_RGB565,
+    /*
+     * 传感器输出格式。
+     *
+     * s_use_converter = true  -> YUV422 + 硬件转换器 (CPU 零开销)
+     * s_use_converter = false -> GC0308 直接输出 RGB565 (不走转换器)
+     *
+     * camera_init() 会按这个开关改写配置, 所以这里给的是默认值。
+     */
+    .pixel_format = PIXFORMAT_YUV422,
+    .conv_mode    = YUV422_TO_RGB565,
     .frame_size   = FRAMESIZE_QVGA,   /* 320x240 */
     .fb_count     = 4,
     .fb_location  = CAMERA_FB_IN_PSRAM,
@@ -517,6 +1545,94 @@ static camera_config_t camera_config = {
     /* SCCB 复用共享 I2C 总线 (SDA=3/SCL=2) */
     .sccb_i2c_port = BOARD_I2C_PORT,
 };
+
+/*
+ * 【A/B 对照开关】PSRAM DMA 直写模式 开/关。
+ *
+ * 这是目前【证据最强】的根因假设:
+ *
+ *   测到的现象 (对原始 RGB565 逐字节分析):
+ *     - 连续两帧之间, 低字节有 81.4% 发生变化
+ *     - 每个被破坏的字节平均翻了 3.3 个 bit
+ *     - 相邻像素之间没有任何错位相关的特征 (corr ≈ 0.1)
+ *     -> 这不是"格式解释错了"(那会是确定性的), 而是【随机的位错误】
+ *
+ *   也就是说: DVP 搬进来的数据本身就有 bit 被翻转了。
+ *   esp32-camera 的 README 对此有明确警告:
+ *     "Using YUV or RGB puts a lot of strain on the chip because writing
+ *      to PSRAM is not particularly fast. The result is that image data
+ *      might be missing. This is particularly true if WiFi is enabled."
+ *
+ *   "image data might be missing" —— 正是我们看到的花屏。
+ *
+ * 为什么做成运行时开关:
+ *   关掉 PSRAM DMA 后, DVP 数据先落到内部 RAM, 再由 CPU 拷到 PSRAM,
+ *   CPU 拷贝是可靠的, 不会丢 bit。代价是每帧多一次 153KB 的 memcpy,
+ *   帧率会从 24fps 降到大约 15fps —— 对"看护"这个场景完全够用,
+ *   而且【不花屏】比【高清】重要得多。
+ *
+ * ---------------------------------------------------------------------------
+ * 【最终定论 —— 用"彩条帧间差异"客观选出来的配置】
+ *
+ * 实测方法: 打开传感器内置彩条 (固定图样, 完全不经过镜头),
+ * 连续抓两帧原始数据做逐位对比。彩条是静止的, 所以
+ * 【任何差异 100% 都是链路在破坏数据】。
+ *
+ * 实测结果 (bit 翻转率 = 每帧每个 bit 被破坏的概率):
+ *   PSRAM直写 + PCLK二分频 (原默认)      49.15%   <- 花屏
+ *   PSRAM直写 + PCLK八分频                47.33%
+ *   PSRAM直写 + PCLK四分频                39.55%
+ *   关PSRAM直写 + PCLK二分频              11.88%
+ *   关PSRAM直写 + PCLK八分频              14.94%
+ *   关PSRAM直写 + PCLK四分频               1.75%   <- 【最优】
+ *
+ * 也就是说要同时满足两个条件才干净:
+ *   1) 关掉 PSRAM 直写 —— DVP 数据先落内部 RAM, CPU 再拷到 PSRAM。
+ *      esp32-camera README 明确警告过: "writing to PSRAM is not
+ *      particularly fast. The result is that image data might be missing."
+ *      PSRAM 直写时 DVP DMA 和 LCD SPI DMA 抢同一条总线, 采样错位就丢 bit。
+ *   2) PCLK 四分频 —— 把 PCLK 压到 ~12MHz, 远低于 DVP 可靠采样范围。
+ *
+ * 验证: 真实场景抓两帧, 归一化掉自动曝光变化后【逐像素完全一致】
+ *       (差异 > 4 的像素占比 0.00%), 采集链路彻底干净。
+ *
+ * 代价: 帧率从 ~12fps 降到 ~6fps (多一次 153KB memcpy + PCLK 减半)。
+ *       对"远程看护"这个场景完全够用, 而【不花屏】比【高清】重要得多。
+ */
+static volatile bool s_psram_dma_mode = false;  /* false = DVP 落内部RAM再拷 (不丢 bit) */
+
+/*
+ * GC0308 的 PCLK 分频系数 (寄存器 0x28 bit[6:4])。
+ *
+ * 值 n 表示 PCLK = 内部时钟 / 2^n:
+ *   0 = 不分频 (PCLK 最高, 24MHz XCLK 下可到 ~48MHz -> 实测 43% bit 翻转)
+ *   1 = 二分频 (PCLK ~24MHz, 实测 11.9% bit 翻转)
+ *   2 = 四分频 (PCLK ~12MHz, 实测 1.75% bit 翻转)  <- 【最终采用】
+ *   3 = 八分频 (PCLK ~6MHz,  太慢, 帧率掉到 4fps, 收益反而变差)
+ *
+ * esp32-camera 驱动只在 CONFIG_IDF_TARGET_ESP32 下强制设成 1,
+ * ESP32-S3 走不到, 所以这里必须自己补上。
+ *
+ * 【最终定论】必须和"关掉 PSRAM 直写"同时使用, 单用任何一项都不够:
+ *   PSRAM直写 + 四分频 = 39.55%  (还是花)
+ *   关PSRAM直写 + 四分频 = 1.75%  (干净)
+ */
+#define GC0308_PCLK_DIV 2
+
+/*
+ * GC0308 手动曝光参数 (只在 AEC 关闭时生效)。
+ *
+ * GC0308_EXPOSURE_TIME 是 12bit 曝光时间:
+ *   实际寄存器值 = (0x03 << 4) | (0x04 >> 4)
+ *   驱动注释里说默认约 0x1E0 (480), 我们就沿用这个值。
+ *
+ * GC0308_GLOBAL_GAIN 是 0x50 的 6bit 全局增益, 驱动默认 0x14 (20)。
+ *
+ * 这两个值决定固定曝光下的画面亮度。460/20 在家里实测亮度约 26000/65535
+ * (约占满量程 40%), 看起来正常不偏暗。
+ */
+#define GC0308_EXPOSURE_TIME  480
+#define GC0308_GLOBAL_GAIN    20
 
 /* 摄像头诊断: 直接在 SCCB 上读 GC0308 的 PID, 定位探测失败原因 */
 static void camera_diag_sccb(void)
@@ -551,12 +1667,75 @@ static void camera_init(void)
 {
     camera_diag_sccb();
 
+    /*
+     * 【关键】PSRAM DMA 直写模式的开关。
+     *
+     * esp_camera_set_psram_mode(false) 必须在 esp_camera_init() 【之前】调用:
+     * 它先改全局标志, 然后重新配置一遍摄像头。
+     * 但我们这里还没 init 过, 所以直接改标志 + 让 sdkconfig 决定初值。
+     *
+     * 走的是 esp_camera_set_psram_mode -> esp_camera_reconfigure 的路径,
+     * 会把整套 DMA/帧缓冲按新模式重算一遍。
+     */
+    ESP_LOGI(TAG, "PSRAM DMA 直写模式: %s", s_psram_dma_mode ? "开 (DVP 直写 PSRAM)" : "关 (DVP 落内部RAM)");
+    ESP_LOGI(TAG, "硬件转换器: %s", s_use_converter ? "开 (YUV422 -> RGB565)" : "关 (GC0308 直出 RGB565)");
+
+    /*
+     * 按开关配置传感器输出格式。
+     *   用转换器:  pixel_format = YUV422,  conv_mode = YUV422_TO_RGB565
+     *   不用转换器: pixel_format = RGB565, conv_mode = CONV_DISABLE
+     */
+    if (s_sensor_mode == SENSOR_MODE_CONV_RGB565) {
+        camera_config.pixel_format = PIXFORMAT_YUV422;
+        camera_config.conv_mode    = YUV422_TO_RGB565;
+    } else if (s_sensor_mode == SENSOR_MODE_RAW_RGB565) {
+        camera_config.pixel_format = PIXFORMAT_RGB565;
+        camera_config.conv_mode    = CONV_DISABLE;
+    } else if (s_sensor_mode == SENSOR_MODE_RAW_YUV422) {
+        /*
+         * 传感器直出 YUV422, 转换器【关闭】。
+         *
+         * 这是【真值模式】: GC0308 的原生格式, 一个字节都不经过
+         * ESP32-S3 的转换器和位打包逻辑。
+         * 帧缓冲布局: Y0 U0 Y1 V1 Y2 U2 Y3 V3 (每像素 2 字节)。
+         *
+         * 如果这个模式干净, 而 mode 0/1 花, 就证明问题出在
+         * ESP32-S3 的转换器/打包这一环, 而不在 DVP 链路本身。
+         */
+        camera_config.pixel_format = PIXFORMAT_YUV422;
+        camera_config.conv_mode    = CONV_DISABLE;
+    } else {
+        /* 灰度: 1 字节/像素, 不打包不转换 —— 最干净的 DVP 探针 */
+        camera_config.pixel_format = PIXFORMAT_GRAYSCALE;
+        camera_config.conv_mode    = CONV_DISABLE;
+    }
+    ESP_LOGI(TAG, "传感器模式: %s",
+             s_sensor_mode == SENSOR_MODE_CONV_RGB565 ? "YUV422+硬件转换器->RGB565" :
+             s_sensor_mode == SENSOR_MODE_RAW_RGB565  ? "传感器直出 RGB565" :
+             s_sensor_mode == SENSOR_MODE_RAW_YUV422  ? "传感器直出 YUV422 (真值模式)" :
+                                                       "GRAYSCALE (1字节/像素)");
+
     esp_err_t err = esp_camera_init(&camera_config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "摄像头初始化失败: 0x%x", err);
         ESP_LOGE(TAG, "  排查: 1)PSRAM Octal 2)SCCB 复用 I2C 是否已初始化 3)GC0308 供电/复位");
         return;
     }
+
+    /*
+     * init 之后再强制设置一次, 确保模式与 s_psram_dma_mode 一致。
+     * (esp_camera_init 会用 cam_hal 里的默认值, 也就是 sdkconfig 的
+     *  CONFIG_CAMERA_PSRAM_DMA=y, 所以这里要显式纠正。)
+     */
+    if (esp_camera_get_psram_mode() != s_psram_dma_mode) {
+        ESP_LOGI(TAG, "切换 PSRAM DMA 模式 -> %s", s_psram_dma_mode ? "开" : "关");
+        err = esp_camera_set_psram_mode(s_psram_dma_mode);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "切换 PSRAM DMA 模式失败: %s", esp_err_to_name(err));
+        }
+    }
+    ESP_LOGI(TAG, "PSRAM DMA 模式确认: %s",
+             esp_camera_get_psram_mode() ? "开" : "关");
 
     sensor_t *s = esp_camera_sensor_get();
     if (s != NULL) {
@@ -574,6 +1753,543 @@ static void camera_init(void)
         s->set_brightness(s, 1);
     }
     ESP_LOGI(TAG, "摄像头初始化成功");
+
+    /*
+     * 【关键修复】GC0308 的 PCLK 分频。
+     *
+     * esp32-camera 驱动里, reset() 有这么一段:
+     *   #ifdef CONFIG_IDF_TARGET_ESP32
+     *       set_reg_bits(slv_addr, PCLK_DIV, 4, 0x07, 1);  // pclk <= 15MHz
+     *   #endif
+     *
+     * 也就是说: 【只有 ESP32 目标会强制把 PCLK 降下来】,
+     * ESP32-S3 / ESP32-S2 走不到这段代码, PCLK 保持默认不分频。
+     *
+     * 而 BOX3 板载 XCLK 是 24MHz, GC0308 的 PCLK 默认可以到 ~48MHz。
+     * DVP 在这么高的时钟下采样, 数据线上的建立/保持时间不够,
+     * 于是每个像素都有几个 bit 被采错 —— 表现就是"满屏花屏 + 闪烁"。
+     *
+     * 这与我们的全部实测证据吻合:
+     *   - 帧缓冲在持有期间 hash 完全相同  -> 不是 DMA 覆盖
+     *   - 连续帧每一位翻转率 ~48%       -> 位在采集时就采错了
+     *   - 传感器内置彩条 (不过镜头) 也花 -> 与光学/曝光无关
+     *   - 关 Wi-Fi / 关 PSRAM 直写 / 换格式 都无效 -> 不是总线争用/格式错误
+     *
+     * 所以这里显式把 PCLK 分频设成 2 (四分频), 把 PCLK 压到 ~12MHz。
+     *
+     * 【最终定论】用"彩条帧间 bit 翻转率"客观标定出来的最优组合是:
+     *   关掉 PSRAM 直写 + PCLK 四分频 -> bit 翻转率 1.75% (干净)
+     *   只做其中一项都不够 (PSRAM直写+四分频 = 39.55%, 仍然花)。
+     */
+    {
+        uint8_t page = 0xfe;
+        uint8_t buf[2];
+
+        /* 先确保在 page0 */
+        i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                   &page, 1, 100 / portTICK_PERIOD_MS);
+
+        /*
+         * 一次 I2C 事务写 reg+value (拆开写会写错寄存器! 实测踩过坑)。
+         * bit[6:4] = 分频系数, 与驱动 set_reg_bits(slv_addr, PCLK_DIV, 4, 0x07, 1) 一致。
+         */
+        buf[0] = 0x28;
+        buf[1] = (uint8_t)((GC0308_PCLK_DIV & 0x07) << 4);
+        esp_err_t e = i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                                  buf, 2, 100 / portTICK_PERIOD_MS);
+        if (e == ESP_OK) {
+            /* 回读确认 */
+            uint8_t rb = 0;
+            i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                       &buf[0], 1, 100 / portTICK_PERIOD_MS);
+            if (i2c_master_read_from_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                            &rb, 1, 100 / portTICK_PERIOD_MS) == ESP_OK) {
+                ESP_LOGI(TAG, "PCLK 分频已设为 %d (0x28=0x%02x), 回读 0x%02x",
+                         GC0308_PCLK_DIV, buf[1], rb);
+            }
+        } else {
+            ESP_LOGW(TAG, "设置 PCLK 分频失败: %s", esp_err_to_name(e));
+        }
+    }
+
+    /*
+     * ---------------------------------------------------------------------
+     * 【关闭自动曝光 AEC/AGC —— 解决"画面忽明忽暗的闪烁"】
+     * ---------------------------------------------------------------------
+     *
+     * 【现象】画面亮度在 10670 ~ 32684 之间来回跳 (幅度 206%),
+     *         用户看到的就是"忽明忽暗", 主观上就是"闪烁"。
+     *
+     * 【取证】全寄存器扫描 (0x00-0xff, 连续 6 次快照) 发现:
+     *         唯一在变的寄存器是 0xd4 —— 它在 0x0B 和 0x1D 之间来回切,
+     *         而且和画面亮度【严格对应】:
+     *             0xd4 = 0x0B -> 平均亮度 14349
+     *             0xd4 = 0x1D -> 平均亮度 28885
+     *             Pearson 相关系数 = 0.89
+     *         0xd4 就是 GC0308 的 "AEC 当前曝光判决值"。
+     *
+     *         为什么别的寄存器看起来不变?
+     *           0x03/0x04 是【手动】曝光寄存器 (AEC 关时才生效), 所以一直不变;
+     *           0xd0-0xd3 是 AE 的【控制参数】, 也不是判决结果;
+     *           判决结果只写在 0xd4 一个字节里 —— 所以之前一直找不到。
+     *
+     * 【根因】GC0308 的 AE 算法在这个场景下会来回震荡 (hunting):
+     *         它把画面调亮 -> 目标亮度超过阈值 -> 又调暗 -> 再调亮...
+     *         对于"远程看护"这种需要画面稳定的场景, 这种震荡就是闪烁。
+     *
+     * 【解决】关掉 AEC 和 AGC, 用固定曝光 + 固定增益, 只保留 AWB
+     *         (AWB 关系到颜色, 关了会偏色, 而且它不会造成亮度震荡)。
+     *
+     *         实测: AEC 关掉后
+     *             0xd4 变化数 2 -> 1
+     *             亮度幅度  206% -> 0%   (26155 +/- 20, 完全稳定)
+     *
+     * 【代价】环境光变化时画面亮度不会自动适应。
+     *         需要的话可以用串口命令调整:
+     *             expo <time> [gain]   曝光时间 0..4095, 全局增益 0..63
+     *             aelock 0              恢复自动曝光
+     */
+    {
+        uint8_t page = 0xfe;
+        uint8_t buf[2];
+
+        if (i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                       &page, 1, 100 / portTICK_PERIOD_MS) == ESP_OK) {
+            /*
+             * AAAA_EN (0x22):
+             *   bit0 = AEC enable
+             *   bit1 = AWB enable
+             *   bit2 = AGC enable
+             * 默认值 0x57 = 1010111b -> AEC 开, AWB 开, AGC 开
+             * 关掉 AEC+AGC: 0x57 & ~0x05 = 0x52 = 1010010b -> 只留 AWB
+             */
+            buf[0] = 0x22;
+            buf[1] = 0x52;
+            if (i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                           buf, 2, 100 / portTICK_PERIOD_MS) == ESP_OK) {
+                ESP_LOGI(TAG, "已关闭自动曝光 (AAAA_EN=0x52, AEC/AGC 关, AWB 保留) —— 消除画面闪烁");
+            }
+        }
+
+        /*
+         * 【关键顺序】先关 AEC, 再写曝光/增益。
+         *
+         * 实测踩坑: 如果先写 0x03/0x04/0x50 再关 AEC, AEC 会被【重新打开】
+         * (传感器把"手动写曝光"当成一次新的 AE 请求), 于是 0xd4 又开始跳。
+         * 正确顺序: 写 0x22=0x52 关掉 AEC -> 再写曝光/增益 -> 最后再写一次
+         * 0x22=0x52 确认 AEC 还是关的。
+         *
+         * 曝光时间用驱动默认的 0x1E0 (480) 对应的寄存器组合:
+         *   12bit 值 = (0x03 << 4) | (0x04 >> 4)
+         *   480 = 0x1E0 -> 0x03 = 0x1E, 0x04 = 0x00
+         * 全局增益 0x50 = 0x14 (20), 也是驱动默认值。
+         */
+        uint8_t expo[2];
+        expo[0] = 0x03;
+        expo[1] = (uint8_t)((GC0308_EXPOSURE_TIME >> 4) & 0xFF);
+        i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                   expo, 2, 100 / portTICK_PERIOD_MS);
+        expo[0] = 0x04;
+        expo[1] = (uint8_t)((GC0308_EXPOSURE_TIME << 4) & 0xF0);
+        i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                   expo, 2, 100 / portTICK_PERIOD_MS);
+
+        uint8_t gain[2] = { 0x50, (uint8_t)GC0308_GLOBAL_GAIN };
+        i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                   gain, 2, 100 / portTICK_PERIOD_MS);
+
+        /* 最后再关一次 AEC, 确认它没被前面的写重新打开 */
+        buf[0] = 0x22;
+        buf[1] = 0x52;
+        i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                   buf, 2, 100 / portTICK_PERIOD_MS);
+
+        ESP_LOGI(TAG, "固定曝光: time=%d (0x%03x), 全局增益=%d (0x%02x), AEC 保持关闭",
+                 GC0308_EXPOSURE_TIME, GC0308_EXPOSURE_TIME,
+                 GC0308_GLOBAL_GAIN, GC0308_GLOBAL_GAIN);
+    }
+}
+
+/*
+ * 打开/关闭传感器内置彩条 (color bar)。
+ *
+ * ---------------------------------------------------------------------------
+ * 这是判定"根因在哪"的【黄金标准】测试:
+ *
+ *   彩条是传感器内部生成的固定图案, 完全不经过镜头和光电转换。
+ *   所以:
+ *     - 彩条干净 -> 传感器到 PSRAM 的整条采集链路是好的,
+ *                   问题在【我们怎么解释这些数据】(格式/位对齐/字节序)。
+ *     - 彩条也花 -> 问题在【采集链路本身】(DVP 电气/时钟/DMA),
+ *                   跟数据解释无关。
+ *
+ * GC0308: 寄存器 0x2e (OUT_CTRL) bit0 = 1 打开彩条。
+ */
+static void camera_set_colorbar(bool on)
+{
+    sensor_t *s = esp_camera_sensor_get();
+    if (s == NULL) {
+        ESP_LOGE(TAG, "没有传感器句柄");
+        return;
+    }
+    if (s->set_colorbar != NULL) {
+        s->set_colorbar(s, on ? 1 : 0);
+        ESP_LOGI(TAG, "传感器彩条: %s", on ? "开 (采集链路测试用)" : "关");
+    } else {
+        ESP_LOGW(TAG, "传感器不支持彩条");
+    }
+}
+
+/*
+ * 运行时调节 GC0308 的 PCLK 分频 (寄存器 0x28)。
+ *
+ * ---------------------------------------------------------------------------
+ * 【为什么这是最关键的旋钮】
+ *
+ * 实测证据链:
+ *   1. 固件 hash 测试: 帧缓冲在持有期间【完全稳定】(两次哈希相同)
+ *      -> 不是 DMA 覆盖 / 不是 PSRAM 撕裂。
+ *   2. 连续帧逐位翻转率 ~48-50% (接近随机)
+ *      -> 数据位在采集时就错了, 不是显示环节搞坏的。
+ *   3. 传感器内置彩条 (完全不经过镜头和光电转换) 同样花
+ *      -> 问题在【DVP 数字通路】, 与光学/曝光无关。
+ *   4. 关 Wi-Fi / 关 PSRAM 直写 / 换 RGB565 / 换灰度 都无法根治
+ *      -> 不是总线争用, 不是格式解释错误。
+ *
+ * 以上四条合起来指向唯一剩下的解释:
+ *   【PCLK 太快, 数据线在时钟边沿附近被采样, 采到了错的位】
+ *
+ * GC0308 的 PCLK_DIV (0x28) 就是干这个的:
+ *   bit[6:4] = PCLK 分频系数
+ *   驱动里 esp32 目标会强制设成 1 (保证 pclk <= 15MHz),
+ *   但【ESP32-S3 目标没有这段代码】—— 默认寄存器值 0x00 = 不分频。
+ *
+ * 官方正点原子例子用 24MHz XCLK, 在 ESP32-S3 上 PCLK 可能到 48MHz 以上,
+ * 远超 DVP 可靠的采样范围, 于是每个像素都有位被采错 -> 花屏。
+ *
+ * 用法: pclk 0~3  (0=不分频 1=二分频 2=四分频 3=八分频)
+ *       发 q 看 g2_bad, 或者用"彩条帧间 bit 翻转率"客观评估。
+ */
+/*
+ * 锁定/解锁 GC0308 的自动曝光 (串口命令 "aelock 0|1")。
+ *
+ * ---------------------------------------------------------------------------
+ * 【为什么需要这个】
+ *
+ * 实测发现: 画面亮度会在 11000 ~ 27000 之间来回跳 (幅度 140%),
+ * 用户看到的"闪烁"就是它。而所有我们能读到的 AE 寄存器
+ * (0x03/0x04 曝光, 0x22 AAAA_EN, 0x50 GLOBAL_GAIN, 0xd0-0xd3 AEC 判决)
+ * 全都【没有变化】—— 说明 GC0308 的 AE 算法把判决结果放在
+ * 其他寄存器/内部状态里, 我们读不到, 但它确实在跳。
+ *
+ * 对"远程看护"这个场景来说, AE 反复跳 = 画面忽明忽暗 = 用户以为在闪。
+ * 所以直接【关掉 AE, 用固定曝光和固定增益】。
+ *
+ * GC0308 手动曝光:
+ *   0x03 (EXPOSURE_HIGH) bit[7:4] + 0x04 (EXPOSURE_LOW) bit[7:4]
+ *       -> 12bit 曝光时间 = (0x03 << 4) | (0x04 >> 4)
+ *       取值 0x1E0 (480) 是驱动注释里的默认值
+ *   0x50 (GLOBAL_GAIN) 6bit 全局增益, 默认 0x14 (20)
+ *   0x22 (AAAA_EN) bit0 = AEC, bit2 = AGC
+ *       写 0x57 & ~0x05 = 0x52 可以同时关掉 AEC 和 AGC
+ *       (0x57 = 1010111b, 清掉 bit0/bit2 得 1010010b = 0x52)
+ *
+ * 关 AE 之后, 画面亮度就固定了, 不会忽明忽暗。
+ * 代价: 环境光变化时要手动重新调曝光(aelock 命令可以带参数)。
+ */
+static void camera_set_ae_lock(bool lock)
+{
+    uint8_t page = 0xfe;
+    uint8_t buf[2];
+
+    /* 先确保在 page0 */
+    if (i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                   &page, 1, 100 / portTICK_PERIOD_MS) != ESP_OK) {
+        ESP_LOGE(TAG, "写 0xFE 失败");
+        return;
+    }
+
+    if (lock) {
+        /*
+         * 关 AEC (bit0) 和 AGC (bit2): 0x57 & ~0x05 = 0x52
+         * 保留 AWB (bit1), 否则画面会偏色。
+         */
+        buf[0] = 0x22;
+        buf[1] = 0x52;
+        if (i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                       buf, 2, 100 / portTICK_PERIOD_MS) != ESP_OK) {
+            ESP_LOGE(TAG, "写 0x22 失败");
+            return;
+        }
+        ESP_LOGI(TAG, "AE 已锁定 (AAAA_EN=0x52, AEC/AGC 关, AWB 保留)");
+    } else {
+        buf[0] = 0x22;
+        buf[1] = 0x57;
+        if (i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                       buf, 2, 100 / portTICK_PERIOD_MS) != ESP_OK) {
+            ESP_LOGE(TAG, "写 0x22 失败");
+            return;
+        }
+        ESP_LOGI(TAG, "AE 已解锁 (AAAA_EN=0x57, AEC/AGC 开)");
+    }
+
+    /* 回读确认 */
+    uint8_t rb = 0;
+    if (i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                   (uint8_t[]){0x22}, 1,
+                                   100 / portTICK_PERIOD_MS) == ESP_OK &&
+        i2c_master_read_from_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                    &rb, 1, 100 / portTICK_PERIOD_MS) == ESP_OK) {
+        ESP_LOGI(TAG, "  回读 0x22 = 0x%02x (AEC=%s AGC=%s AWB=%s)",
+                 rb,
+                 (rb & 0x01) ? "开" : "关",
+                 (rb & 0x04) ? "开" : "关",
+                 (rb & 0x02) ? "开" : "关");
+    }
+}
+
+/*
+ * 设置手动曝光时间和增益 (串口命令 "expo <time> <gain>" / "gain <n>"）。
+ *
+ *   expo <time>  -> 曝光时间 0..4095 (写 0x03/0x04)
+ *   gain <n>     -> 全局增益 0..63 (写 0x50)
+ */
+static void camera_set_manual_exposure(int time, int gain)
+{
+    uint8_t page = 0xfe;
+    uint8_t buf[2];
+
+    if (time < 0) time = 0;
+    if (time > 4095) time = 4095;
+    if (gain < 0) gain = 0;
+    if (gain > 63) gain = 63;
+
+    if (i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                   &page, 1, 100 / portTICK_PERIOD_MS) != ESP_OK) {
+        ESP_LOGE(TAG, "写 0xFE 失败");
+        return;
+    }
+
+    /*
+     * 顺序很关键: 先关 AEC, 再写曝光/增益, 最后再关一次 AEC。
+     * (写手动曝光会被传感器当成一次新的 AE 请求, 从而重新打开 AEC。)
+     */
+    buf[0] = 0x22;
+    buf[1] = 0x52;
+    i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                               buf, 2, 100 / portTICK_PERIOD_MS);
+
+    /* 曝光时间: 12bit 拆成 0x03 的 bit[7:4] 和 0x04 的 bit[7:4] */
+    buf[0] = 0x03;
+    buf[1] = (uint8_t)((time >> 4) & 0xFF);
+    i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                               buf, 2, 100 / portTICK_PERIOD_MS);
+
+    buf[0] = 0x04;
+    buf[1] = (uint8_t)((time << 4) & 0xF0);
+    i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                               buf, 2, 100 / portTICK_PERIOD_MS);
+
+    /* 全局增益 */
+    buf[0] = 0x50;
+    buf[1] = (uint8_t)gain;
+    i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                               buf, 2, 100 / portTICK_PERIOD_MS);
+
+    /* 再关一次 AEC, 确认没被重新打开 */
+    buf[0] = 0x22;
+    buf[1] = 0x52;
+    i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                               buf, 2, 100 / portTICK_PERIOD_MS);
+
+    ESP_LOGI(TAG, "手动曝光: time=%d (0x%03x), gain=%d (0x%02x), AEC 保持关闭",
+             time, time, gain, gain);
+}
+
+static void camera_set_pclk_div(int div)
+{
+    if (div < 0 || div > 7) {
+        ESP_LOGE(TAG, "pclk 分频系数必须是 0~7");
+        return;
+    }
+    /*
+     * GC0308 PCLK_DIV (0x28):
+     *   bit[6:4] = PCLK 分频系数 (与 esp32-camera 驱动一致:
+     *              set_reg_bits(slv_addr, PCLK_DIV, 4, 0x07, 1))
+     *   bit[2:0] = 保留
+     *
+     * 关键: 必须【一次 I2C 事务】写 reg+value, 不能拆成两次!
+     * GC0308 的 SCCB 协议是 "写寄存器地址 -> 写数据" 在同一个事务里,
+     * 拆开写的话第二次事务会被当成"写数据"而不是"写寄存器地址",
+     * 结果就是把垃圾写进了别的寄存器 (实测回读 0x32, 完全对不上)。
+     */
+    uint8_t page = 0xfe;
+    uint8_t page_val = 0x00;
+    uint8_t buf[2];
+
+    /* 先确保在 page0 */
+    if (i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                   &page, 1, 100 / portTICK_PERIOD_MS) != ESP_OK) {
+        ESP_LOGE(TAG, "写 0xFE 失败");
+        return;
+    }
+    (void)page_val;
+
+    /* 一次事务写 reg + value */
+    buf[0] = 0x28;
+    buf[1] = (uint8_t)((div & 0x07) << 4);
+    esp_err_t err = i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                                buf, 2, 100 / portTICK_PERIOD_MS);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "写 0x28 失败: %s", esp_err_to_name(err));
+        return;
+    }
+
+    /* 回读确认: 读寄存器要先写 reg 地址再读 */
+    if (i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                   &buf[0], 1, 100 / portTICK_PERIOD_MS) == ESP_OK) {
+        uint8_t rb = 0;
+        if (i2c_master_read_from_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                        &rb, 1, 100 / portTICK_PERIOD_MS) == ESP_OK) {
+            ESP_LOGI(TAG, "PCLK 分频寄存器 0x28: 写入 0x%02x, 回读 0x%02x (bit[6:4]=%d)",
+                     buf[1], rb, (rb >> 4) & 0x07);
+        }
+    }
+    ESP_LOGI(TAG, "等 1 秒再发 q 看 g2_bad 是否下降");
+}
+
+/*
+ * 读取 GC0308 page0 的一段寄存器并打印。
+ *
+ * 用法:
+ *   regs             -> 打印 0x00-0x5f
+ *   regs <st> <en>   -> 打印指定范围 (支持 0x 十六进制)
+ *
+ * 用途: 判定"画面闪烁"到底是传感器自动曝光在跳, 还是数据链路在坏。
+ *   - 曝光/增益寄存器在变  -> 是传感器 AE 行为 (可以关掉 AE 解决)
+ *   - 寄存器不变但画面亮度在跳 -> 是数据链路问题
+ */
+static void camera_dump_regs_page(int page_no, int start, int end)
+{
+    uint8_t page = 0xfe;
+    uint8_t pv = (uint8_t)page_no;
+
+    if (i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                   &page, 1, 100 / portTICK_PERIOD_MS) != ESP_OK) {
+        ESP_LOGE(TAG, "写 0xFE 失败");
+        return;
+    }
+    if (i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                   &pv, 1, 100 / portTICK_PERIOD_MS) != ESP_OK) {
+        ESP_LOGE(TAG, "选 page%d 失败", page_no);
+        return;
+    }
+
+    for (int r = start; r <= end; r++) {
+        uint8_t rb = 0;
+        if (i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                       (uint8_t[]){(uint8_t)r}, 1,
+                                       100 / portTICK_PERIOD_MS) != ESP_OK) {
+            continue;
+        }
+        if (i2c_master_read_from_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                        &rb, 1, 100 / portTICK_PERIOD_MS) != ESP_OK) {
+            continue;
+        }
+        ESP_LOGI(TAG, "REG 0x%02x = 0x%02x", r, rb);
+    }
+
+    /* 选回 page0, 避免影响后面的操作 */
+    pv = 0x00;
+    i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                               &pv, 1, 100 / portTICK_PERIOD_MS);
+}
+
+static void camera_dump_regs_range(int start, int end)
+{
+    camera_dump_regs_page(0x00, start, end);
+}
+
+/*
+ * GC0308 里和"自动曝光/自动增益"直接相关的寄存器 (page0):
+ *
+ *   0x03-0x04  EXPOSURE_HIGH/LOW   曝光时间
+ *   0x22       AAAA_EN              bit0=AEC bit1=AWB bit2=AGC
+ *   0x50       GLOBAL_GAIN          全局增益 (AGC 的实际输出)
+ *   0x5a-0x5c  AWB_R/G/B_GAIN       白平衡增益
+ *   0xd0-0xd3  AEC_MODE1/2/3, AEC_TARGET_Y  (AE 目标亮度 + 控制位)
+ *
+ * 其中【0xd0-0xd3 是分页寄存器, 必须先写 0xfe 选页再读】,
+ * 读出来的值直接反映 AE 算法当前的判决结果。
+ */
+/*
+ * 查询当前生效的采集配置 (串口命令 "cfg")。
+ *
+ * 为什么需要它:
+ *   开机早期日志 (PSRAM 模式 / PCLK 分频) 是在 USB-Serial-JTAG 还没
+ *   完全就绪时打印的, 用串口抓经常抓不到 —— 只能靠"事后查寄存器"
+ *   来确认最终生效的配置。所以这里提供运行时查询:
+ *     - PSRAM DMA 模式: 直接问 esp32-camera
+ *     - PCLK 分频: 回读 GC0308 的 0x28 寄存器
+ *     - 传感器模式: 问固件自己的状态变量
+ */
+static void camera_print_config(void)
+{
+    uint8_t rb = 0;
+    uint8_t reg = 0x28;
+
+    ESP_LOGI(TAG, "==== 采集配置 ====");
+    ESP_LOGI(TAG, "PSRAM DMA 直写: %s  (%s)",
+             esp_camera_get_psram_mode() ? "开" : "关",
+             esp_camera_get_psram_mode()
+                 ? "DVP 直写 PSRAM —— 会丢 bit, 花屏"
+                 : "DVP 落内部 RAM 再拷 —— 不丢 bit, 已验证");
+
+    /* 回读 GC0308 的 PCLK_DIV (0x28) */
+    uint8_t page = 0xfe;
+    if (i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                   &page, 1, 100 / portTICK_PERIOD_MS) == ESP_OK &&
+        i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                   &reg, 1, 100 / portTICK_PERIOD_MS) == ESP_OK &&
+        i2c_master_read_from_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                    &rb, 1, 100 / portTICK_PERIOD_MS) == ESP_OK) {
+        int div = (rb >> 4) & 0x07;
+        ESP_LOGI(TAG, "GC0308 PCLK 分频: %d (寄存器 0x28=0x%02x, bit[6:4]=%d)  "
+                      "-> PCLK ~%dMHz",
+                 div, rb, div, (div == 0) ? 48 : (48 >> div));
+    } else {
+        ESP_LOGW(TAG, "GC0308 PCLK 分频: 读取失败");
+    }
+
+    ESP_LOGI(TAG, "传感器模式: %s",
+             s_sensor_mode == SENSOR_MODE_CONV_RGB565 ? "YUV422 + 硬件转换器 (YUV422_TO_RGB565)" :
+             s_sensor_mode == SENSOR_MODE_RAW_RGB565  ? "传感器直出 RGB565" :
+             s_sensor_mode == SENSOR_MODE_RAW_YUV422  ? "传感器直出 YUV422 (真值模式)" :
+                                                         "GRAYSCALE (1字节/像素)");
+
+    /* AE 状态: 读 AAAA_EN 和 AEC 当前判决值 0xd4 */
+    if (i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                   &page, 1, 100 / portTICK_PERIOD_MS) == ESP_OK) {
+        uint8_t aaa = 0, d4 = 0;
+        if (i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                       (uint8_t[]){0x22}, 1,
+                                       100 / portTICK_PERIOD_MS) == ESP_OK &&
+            i2c_master_read_from_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                        &aaa, 1, 100 / portTICK_PERIOD_MS) == ESP_OK) {
+            i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                       (uint8_t[]){0xd4}, 1,
+                                       100 / portTICK_PERIOD_MS);
+            i2c_master_read_from_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                        &d4, 1, 100 / portTICK_PERIOD_MS);
+            ESP_LOGI(TAG, "自动曝光: AEC=%s AGC=%s AWB=%s  (AAAA_EN=0x%02x)  "
+                          "AEC判决值 0xd4=0x%02x",
+                     (aaa & 0x01) ? "开" : "关",
+                     (aaa & 0x04) ? "开" : "关",
+                     (aaa & 0x02) ? "开" : "关",
+                     aaa, d4);
+        }
+    }
+    ESP_LOGI(TAG, "==================");
 }
 
 /* ---------------- 摄像头生产者任务 ---------------- */
@@ -582,25 +2298,61 @@ static void camera_init(void)
  * 唯一碰摄像头的任务。
  *
  * 流程:
- *   esp_camera_fb_get()  -> 拷进自己的 RGB565 槽位 (稳定副本)
- *                        -> 编码成 JPEG 放进 JPEG 槽位
+ *   esp_camera_fb_get()  -> 按需拷进 RGB565 槽位 (稳定副本)
+ *                        -> 按需编码成 JPEG 放进 JPEG 槽位
  *                        -> 归还摄像头帧缓冲
  *
- * 关键点:
- *   1) 拷进自己的槽位再给下游用。摄像头是连续 DMA, fb_count=2 时下一帧的
- *      DMA 可能在我们还没用完这一帧时就覆盖了它 -> 花屏。拷成副本后
- *      LCD 和视频流拿到的都是稳定数据, 花屏从根上消失。
- *   2) JPEG 编码放在这里做, 而不是放在 HTTP 线程里:
- *      编码是 CPU 密集的活, 放在 HTTP 线程会让同一个线程既编码又等 socket,
- *      而且多客户端时每个客户端都要重复编码一遍 (CPU 直接翻倍)。
- *      现在只编码一次, 所有客户端共用同一个 JPEG 帧。
+ * ---------------------------------------------------------------------------
+ * 关键: 【按需】拷贝 —— 这是修闪花屏的第二个关键点
+ *
+ * 之前每一帧都无条件做:
+ *   1) CRC 校验  : 读整帧 153600 字节  (为了算校验和)
+ *   2) memcpy 拷贝: 读 153600 + 写 153600 字节
+ *   3) CRC 再算   : 再读整帧 153600 字节
+ *   = 每帧至少 460KB 的 PSRAM 访问, 24fps 就是 11 MB/s
+ *
+ * 而 LCD 实际只需要 5fps (LCD_PREVIEW_MS = 200ms),
+ * 没人拉视频流的时候 JPEG 编码根本不需要做。
+ *
+ * 问题在于: PSRAM 总线是共享的。CPU 这样狂刷 PSRAM,
+ * 摄像头的 GDMA 就抢不到带宽 -> DVP 数据来不及搬走
+ * -> 丢行/半帧 -> 屏幕闪花屏。
+ *
+ * esp32-camera 的 README 也明说了:
+ *   "Using YUV or RGB puts a lot of strain on the chip because writing to
+ *    PSRAM is not particularly fast. The result is that image data might
+ *    be missing. This is particularly true if WiFi is enabled."
+ *
+ * 所以改成:
+ *   - CRC 校验: 默认关 (只统计, 不每帧读两遍)
+ *   - RGB 拷贝: 只在【LCD 真的需要新帧】时才做 (按 LCD 帧率节流)
+ *   - JPEG 编码: 只在【真的有人拉流】时才做
+ *
+ * 这样空闲时每帧对 PSRAM 的访问降到 0, 摄像头 DMA 独占总线。
  */
 static void camera_producer_task(void *arg)
 {
     int frames = 0;
     int64_t t0 = 0;
+    int64_t last_rgb_copy_us = 0;   /* 上次拷 RGB 槽位的时间戳 */
+    int64_t last_row_dump_us = 0;   /* 上次打亮度剖面的时间戳 */
 
     while (true) {
+        /*
+         * 【安全重配置】如果有人请求重配置摄像头, 先在这里退出循环。
+         *
+         * 关键: 必须在【调用 esp_camera_fb_get() 之前】检查,
+         * 这样退出时手里【没有】帧缓冲, esp_camera_deinit() 就不会
+         * 和生产者抢帧 —— 之前 `conv 0` 复位就是因为在这里没检查。
+         */
+        if (s_cam_pause) {
+            s_cam_paused = true;
+            /* 让出 CPU, 方便重配置那边拿到执行权 */
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        s_cam_paused = false;
+
         int64_t t_start = esp_timer_get_time();
 
         camera_fb_t *fb = esp_camera_fb_get();
@@ -611,10 +2363,49 @@ static void camera_producer_task(void *arg)
         s_cam_get_us = (uint32_t)(esp_timer_get_time() - t_start);
 
         /*
-         * 看门狗诊断: task_wdt 报 "CPU 1: cam_producer" 说明这个任务
-         * 连续很久没让出 CPU。分别记录 "取帧耗时" 和 "编码耗时" 就能定位。
-         * 取帧如果卡住, 说明是 fb_count/GRAB_LATEST 的队列逻辑在绕圈。
+         * GRAYSCALE 模式下每像素只有 1 字节, 不是 RGB565。
+         * 这一模式下我们只做取证 (统计/导出), 不显示也不编码 ——
+         * 因为 LCD 和 JPEG 编码器都只吃 RGB565。
          */
+        if (fb->format == PIXFORMAT_GRAYSCALE || fb->format == PIXFORMAT_YUV422) {
+            /*
+             * YUV422 且未走转换器时, fb->buf 就是传感器的原始 YUV422
+             * (Y0 U0 Y1 V1 ...), 每像素 2 字节。
+             * 注意: fb->format == YUV422 也可能出现在"走转换器"的模式下,
+             * 但那时 fb->buf 里已经是被转成 RGB565 的数据 (格式标记仍是 YUV422)。
+             * 我们只在这里导出原始字节做取证, 不显示, 所以两种情况都安全。
+             */
+            int bytes = (fb->format == PIXFORMAT_GRAYSCALE)
+                        ? (fb->width * fb->height)
+                        : (fb->width * fb->height * 2);
+
+            if (s_raw_capture_requested && s_raw_snapshot != NULL) {
+                memcpy(s_raw_snapshot, fb->buf, (size_t)bytes);
+                s_raw_snapshot_seq++;
+                s_raw_capture_requested = false;
+                ESP_LOGI(TAG, "  已保存原始快照 #%" PRIu32 " (%d 字节)",
+                         (uint32_t)s_raw_snapshot_seq, bytes);
+            }
+            if (s_raw_dump_requested && s_raw_snapshot != NULL) {
+                memcpy(s_raw_snapshot, fb->buf, (size_t)bytes);
+                s_raw_snapshot_seq++;
+                s_raw_capture_requested = false;
+                char hdr[64];
+                int hn = snprintf(hdr, sizeof(hdr), "RAWDUMP %" PRIu32 " %d\r\n",
+                                  (uint32_t)s_raw_snapshot_seq, bytes);
+                (void)write(1, hdr, hn);
+                (void)write(1, s_raw_snapshot, bytes);
+                (void)write(1, "\r\nDONE\r\n", 8);
+                s_raw_dump_requested = false;
+                ESP_LOGI(TAG, "  已导出原始帧 #%" PRIu32 " (%d 字节)",
+                         (uint32_t)s_raw_snapshot_seq, bytes);
+            }
+            esp_camera_fb_return(fb);
+            frames++;
+            s_cam_frames++;
+            vTaskDelay(1);
+            continue;
+        }
 
         if (fb->format != PIXFORMAT_RGB565) {
             ESP_LOGW(TAG, "生产者: 期望 RGB565，实际 %d", (int)fb->format);
@@ -622,37 +2413,134 @@ static void camera_producer_task(void *arg)
             continue;
         }
 
+        int64_t now = esp_timer_get_time();
+
         /*
-         * 帧完整性检测 (自动发现花屏, 不用靠眼睛看)
+         * 【缓冲稳定性测试】决定性实验。
          *
-         * 原理: 摄像头是连续 DMA, 我们在 memcpy 帧缓冲的同时,
-         * 下一帧的 DMA 可能已经开始往同一块缓冲区写了。
-         * 如果在拷贝【前】和拷贝【后】对帧缓冲算一次 CRC,
-         * 两次不一致 => 这一帧在拷贝过程中被改写了 => 撕裂。
+         * 第一次进来: 记下哈希, 然后【在这里等 250ms】再算一次。
+         * 这 250ms 里摄像头会转 5~6 帧。如果第二次哈希不同,
+         * 说明这块帧缓冲在我们【还握着它的时候】就被 DMA 覆盖了。
          *
-         * 对比: 之前是把"帧"当成静态数据用, 撕裂只在画面上表现为花屏,
-         *       根本分不清是摄像头出的问题还是显示出的问题。
+         * (这个测试会让帧率掉到 4fps, 所以只在需要诊断时用命令触发。)
          */
-        uint32_t crc_before = 0, crc_after = 0;
+        if (s_hash_test_armed) {
+            s_hash_test_a = buf_hash((const uint8_t *)fb->buf,
+                                     (size_t)fb->width * fb->height * 2);
+            ESP_LOGI(TAG, "HASH: 第一次 = 0x%08X, 等 250ms 再算...", (unsigned)s_hash_test_a);
+            vTaskDelay(pdMS_TO_TICKS(250));
+            s_hash_test_b = buf_hash((const uint8_t *)fb->buf,
+                                     (size_t)fb->width * fb->height * 2);
+            s_hash_test_armed = false;
+            ESP_LOGI(TAG, "HASH: 第二次 = 0x%08X -> %s",
+                     (unsigned)s_hash_test_b,
+                     (s_hash_test_a == s_hash_test_b)
+                        ? "【相同】帧缓冲稳定, 噪声来自数据本身(传感器/DVP 链路)"
+                        : "【不同】帧缓冲被 DMA 覆盖了! 这就是撕裂/花屏的根因");
+        }
+
+        /*
+         * 噪点行统计 (固件侧第一手数字)。
+         *
+         * 这是定位花屏的关键测量: 直接看【原始 RGB565】有没有垃圾数据,
+         * 不经过 JPEG (JPEG 会把噪点平滑掉, 看不出来)。
+         *
+         * 采样 30 行, 每行 320 像素 -> 约 19KB, 很便宜。
+         */
+        if (s_noise_enabled) {
+            uint32_t nj = 0, ne = 0, nr = 0;
+            measure_noise((const uint8_t *)fb->buf, fb->width, fb->height,
+                          &nj, &ne, &nr);
+            s_noise_jumps = nj;
+            s_noise_energy = ne;
+            s_noise_rows = nr;
+            s_noise_rows_total += nr;
+            s_noise_frames++;
+            measure_bytes((const uint8_t *)fb->buf, fb->width, fb->height, &s_bytes);
+
+            /*
+             * 【BUG 修复】原来"存原始帧快照"被关在 s_noise_enabled 里,
+             * 导致 /raw?capture 请求时如果噪点统计没开, 永远等不到新帧,
+             * 返回的是【上一次的旧数据】。
+             *
+             * 这个 bug 让我们之前的取证分析全部作废:
+             * 抓到的是旧帧, 于是误判成"格式不匹配"(其实是随机的位错误)。
+             * 现在把抓帧移到 s_noise_enabled 块【外面】, 独立生效。
+             */
+        }
+
+        /*
+         * 【花屏量化】总是算 (开销很小: 只读 30 行 = 19KB)。
+         * 这是唯一能客观回答"花屏修好了没有"的指标。
+         */
         {
-            const uint8_t *b = (const uint8_t *)fb->buf;
-            size_t n = (size_t)fb->width * fb->height * 2;
-            for (size_t i = 0; i < n; i++) {
-                crc_before = (crc_before ^ b[i]) * 16777619u;
-            }
+            quality_stat_t q;
+            measure_quality((const uint8_t *)fb->buf, fb->width, fb->height, &q);
+            s_hi_energy = q.hi_energy;
+            s_lo_energy = q.lo_energy;
+            s_hi_jumps = q.hi_jumps;
+            s_lo_jumps = q.lo_jumps;
+            s_bad_rows = q.bad_rows;
+            s_qual_frames++;
+
+            /* 【真正的花屏指标】逐通道拆开算, 见上方注释 */
+            chan_stat_t cs;
+            measure_channel_quality((const uint8_t *)fb->buf, fb->width,
+                                    fb->height, &cs);
+            s_g2_bad_pct = cs.g2_bad_pct;
+            s_g2_energy = cs.g2_energy;
+            s_r5_energy = cs.r5_energy;
+            s_b5_energy = cs.b5_energy;
+        }
+
+        /*
+         * 存一份原始帧快照 (取证用, 独立于噪点统计开关)。
+         * 只在明确请求时才存 —— 每帧 153KB 的拷贝会加重 PSRAM 压力。
+         */
+        if (s_raw_capture_requested && s_raw_snapshot != NULL) {
+            memcpy(s_raw_snapshot, fb->buf, RAW_SNAPSHOT_BYTES);
+            s_raw_snapshot_seq++;
+            s_raw_snapshot_ready = 1;
+            s_raw_capture_requested = false;
+            ESP_LOGI(TAG, "  已保存原始 RGB565 快照 #%" PRIu32, s_raw_snapshot_seq);
+        }
+
+        /*
+         * 【串口导出原始帧】—— 不用 HTTP 也能取证。
+         *
+         * 为什么需要: 设备上的 g2_bad 只是个汇总数字, 想在电脑上
+         * 逐位验证到底哪些 bit 被破坏了, 必须把原始字节流拿回来。
+         *
+         * 协议: 先发一行 ASCII 头 "RAWDUMP <seq> <len>\r\n",
+         *       然后原样发 len 字节的二进制, 最后发 "\r\nDONE\r\n"。
+         */
+        if (s_raw_dump_requested && s_raw_snapshot != NULL) {
+            memcpy(s_raw_snapshot, fb->buf, RAW_SNAPSHOT_BYTES);
+            s_raw_snapshot_seq++;
+            s_raw_capture_requested = false;
+
+            char hdr[64];
+            int hn = snprintf(hdr, sizeof(hdr), "RAWDUMP %" PRIu32 " %d\r\n",
+                              (uint32_t)s_raw_snapshot_seq, RAW_SNAPSHOT_BYTES);
+            /* 用 write() 直出, 避免 ESP_LOG 的格式化和换行干扰二进制流 */
+            (void)write(1, hdr, hn);
+            (void)write(1, s_raw_snapshot, RAW_SNAPSHOT_BYTES);
+            (void)write(1, "\r\nDONE\r\n", 8);
+            s_raw_dump_requested = false;
+            ESP_LOGI(TAG, "  已导出原始帧 #%" PRIu32 " (%" PRIu32 " 字节)",
+                     (uint32_t)s_raw_snapshot_seq, (uint32_t)RAW_SNAPSHOT_BYTES);
         }
 
         /*
          * 逐行亮度剖面 —— 把"花屏"变成可读的数字。
-         *
-         * 每 16 行算一个平均亮度并打出来。
+         * 每 16 行算一个平均亮度。
          *   正常画面: 相邻行的亮度差很小 (画面是连续的自然场景)
          *   花  屏  : 某些行亮度突变, 或者出现 0 / 255 这种极端值
-         *
-         * 价值: 不用盯屏幕猜"哪里花了", 直接看数字定位到具体的行。
-         * 之前所有排查都卡在"只能肉眼看"这一步。
+         * 现在改成【低频采样】(每 2 秒一次), 不再每帧都算 ——
+         * 每帧算一遍要多读 153600 字节 PSRAM, 代价太大。
          */
-        if (frames == 2) {
+        if (now - last_row_dump_us > 2000000) {
+            last_row_dump_us = now;
             const uint8_t *b = (const uint8_t *)fb->buf;
             int w = fb->width;
             for (int y0 = 0; y0 < fb->height; y0 += 16) {
@@ -669,65 +2557,190 @@ static void camera_producer_task(void *arg)
             }
         }
 
-        /* ---- 1) 拷进 RGB565 槽位 (稳定副本) ---- */
-        int rgb_idx = -1;
-        if (slot_acquire(s_rgb_slots, &rgb_idx)) {
-            int64_t t_copy = esp_timer_get_time();
-            memcpy(s_rgb_slots[rgb_idx].buf, fb->buf, RGB565_SLOT_BYTES);
-            s_rgb_slots[rgb_idx].len = RGB565_SLOT_BYTES;
-            s_rgb_copy_us = (uint32_t)(esp_timer_get_time() - t_copy);
+        /*
+         * ---- 1) 按需拷进 RGB565 槽位 (给 LCD 用) ----
+         *
+         * 节流条件: 距上次拷贝超过 LCD_PREVIEW_MS, 或者【还没有任何一帧】。
+         *
+         * 为什么要拷贝而不是直接用 fb->buf:
+         *   fb_count=4 且 GRAB_LATEST 时, 摄像头下一帧的 DMA 可能在我们
+         *   还没用完这一帧时就覆盖了它 -> 撕裂。拷成副本后 LCD 拿到的
+         *   是稳定数据。
+         *
+         * 但拷贝很贵 (读+写 153KB PSRAM), 而 LCD 只要 5fps,
+         * 所以必须按 LCD 的节奏节流, 不能跟着摄像头帧率 (24fps) 跑。
+         */
+        /*
+         * ---- 1) 显示到 LCD ----
+         *
+         * 【直绘模式】(s_lcd_direct_draw = true, 默认):
+         *   不做任何 PSRAM -> PSRAM 拷贝, 直接从摄像头帧缓冲分批画到屏幕。
+         *
+         * 为什么要改成这样 (这是闪花屏的真正原因, 有实测数据):
+         *
+         *   旧路径每 200ms 要做一次 153KB 的 PSRAM -> PSRAM memcpy,
+         *   实测耗时 4.9ms, 是一口气连续读完写完的。
+         *   而就在这 4.9ms 里, 摄像头的 DVP DMA 正在往 PSRAM 里写【下一帧】。
+         *   PSRAM 总线是共享的 —— 我们这一口气把总线占满, DVP DMA 抢不到带宽,
+         *   下一帧就丢数据。丢掉的那些行在帧缓冲里是【上一次残留或垃圾】,
+         *   画到屏幕上就是一条条花带。
+         *
+         *   esp32-camera 的 README 其实早就警告过:
+         *     "Using YUV or RGB puts a lot of strain on the chip because writing
+         *      to PSRAM is not particularly fast. The result is that image data
+         *      might be missing. This is particularly true if WiFi is enabled."
+         *   "image data might be missing" —— 就是我们看到的花屏。
+         *
+         *   实测证据 (拉 82 帧逐帧分析):
+         *     - 每帧有 50~160 行是纯噪声 (相邻像素梯度 > 25)
+         *     - 但把 20 帧【平均】起来, 噪声行变成 0/240, 图像完全干净
+         *       => 场景本身是稳的, 噪声是叠加在稳定内容上的随机扰动
+         *     - 噪声行的位置每帧都不同 (不是固定的几行), 说明是 DMA 丢数据,
+         *       不是固定的硬件缺陷
+         *
+         *   直绘模式怎么解决:
+         *     - 彻底去掉那次 153KB 的 PSRAM->PSRAM 拷贝 (省掉一整口气的总线占用)
+         *     - 画屏幕本身是【分批】的 (每批 20 行 = 12800 字节):
+         *       读一小段 PSRAM -> SPI 发出去 (约 1.7ms) -> 再读下一段
+         *       SPI 发送期间 PSRAM 总线是空的, DVP DMA 能插进来
+         *     - 画完立刻 esp_camera_fb_return(fb), 摄像头缓冲立刻还回池子
+         *
+         *   顺带还消除了"撕裂"隐患: 画的时候帧缓冲一直握在手里, 摄像头
+         *   不会去覆盖它, 所以画面上下必然来自同一帧。
+         *
+         * 【旧路径】(s_lcd_direct_draw = false, 保留用于 A/B 对照):
+         *   拷进 PSRAM 槽位, 由 lcd_preview_task 读槽位画。
+         */
+        /*
+         * ---- 0) 可选: 软件修复绿色低位 ----
+         *
+         * 只有在 s_green_fix 打开时才做, 而且只在【真的要显示/编码】时做,
+         * 避免每帧都白花 CPU。
+         *
+         * 注意: repair_green_low 是【就地】修改的, 所以必须放在
+         * 显示和编码【之前】, 而且要在统计质量指标【之后】
+         * (否则指标就反映不出原始的坏点了)。
+         */
+        bool need_rgb = false;
+        if (last_rgb_copy_us == 0 ||
+            (now - last_rgb_copy_us) >= (int64_t)LCD_PREVIEW_MS * 1000) {
+            need_rgb = true;
+        }
 
-            {
-                const uint8_t *b = (const uint8_t *)fb->buf;
-                size_t n = (size_t)fb->width * fb->height * 2;
-                for (size_t i = 0; i < n; i++) {
-                    crc_after = (crc_after ^ b[i]) * 16777619u;
-                }
-            }
-            if (crc_before != crc_after) {
-                s_torn_frames++;
+        /*
+         * 诊断模式 (lcd1/lcd2) 下屏幕上画的不是摄像头画面,
+         * 所以不需要为了显示而处理帧缓冲 —— 否则白花 CPU,
+         * 而且就地修改会污染 JPEG 流的原始数据。
+         *
+         * 但节流时间戳仍然要更新, 否则 need_rgb 每帧都是 true,
+         * stabilize_brightness 每帧都跑。
+         */
+        if (need_rgb && s_lcd_mode != LCD_MODE_CAMERA) {
+            last_rgb_copy_us = now;
+            need_rgb = false;
+        }
+
+        bool need_jpg = (s_stream_clients > 0);
+
+        if (s_green_fix && (need_rgb || need_jpg)) {
+            repair_green_low((uint8_t *)fb->buf, fb->width, fb->height);
+        }
+
+        /*
+         * ---- 0b) 亮度稳定 (抵消 GC0308 的 AE 周期震荡) ----
+         *
+         * 必须在【显示和编码之前】做, 因为它就地修改帧缓冲。
+         * 也必须在【质量指标统计之后】做 —— 指标要反映原始数据。
+         *
+         * 只在真的要显示/编码时才做, 避免每帧白花 CPU。
+         */
+        if (need_rgb || need_jpg) {
+            stabilize_brightness((uint8_t *)fb->buf, fb->width, fb->height);
+        }
+
+        /*
+         * 【直绘模式】(s_lcd_direct_draw = true, 默认):
+         *   不做任何 PSRAM -> PSRAM 拷贝, 直接从摄像头帧缓冲分批画到屏幕。
+         *
+         * 【重要】必须先检查 s_lcd_mode:
+         *   直绘是在【生产者任务】里做的, 而 lcd_preview_task 负责
+         *   lcd1 (固定图样) / lcd2 (合成图) 这两个诊断模式。
+         *   如果直绘不检查模式, 两个任务会【同时往屏幕画】:
+         *     - lcd_preview_task 每秒画一次合成渐变图
+         *     - 本任务每 200ms 直绘一次摄像头画面
+         *   两者抢 s_lcd_mutex, 屏幕上就是"一闪一闪 + 彩色条纹" ——
+         *   而且 lcd1/lcd2 这两个诊断模式其实从来没真正生效过。
+         *
+         *   所以: 只有在 LCD_MODE_CAMERA 时才允许直绘。
+         */
+        if (need_rgb && s_lcd_direct_draw && s_lcd_mode == LCD_MODE_CAMERA) {
+            int64_t t_draw = esp_timer_get_time();
+            esp_err_t derr = lcd_draw_rgb565(fb->buf, fb->width * 2,
+                                            0, 0, fb->width, fb->height, true, true);
+            s_lcd_draw_us = (uint32_t)(esp_timer_get_time() - t_draw);
+            last_rgb_copy_us = t_draw;
+
+            if (derr == ESP_OK) {
+                s_lcd_direct_frames++;
             } else {
+                ESP_LOGW(TAG, "LCD 直绘失败: %s", esp_err_to_name(derr));
+            }
+        } else if (need_rgb && s_lcd_mode == LCD_MODE_CAMERA) {
+            int rgb_idx = -1;
+            if (slot_acquire(s_rgb_slots, &rgb_idx)) {
+                int64_t t_copy = esp_timer_get_time();
+                memcpy(s_rgb_slots[rgb_idx].buf, fb->buf, RGB565_SLOT_BYTES);
+                s_rgb_slots[rgb_idx].len = RGB565_SLOT_BYTES;
+                s_rgb_copy_us = (uint32_t)(esp_timer_get_time() - t_copy);
+                last_rgb_copy_us = t_copy;
+
                 s_clean_frames++;
-            }
-
-            /*
-             * ---- 2) 按需编码 JPEG ----
-             *
-             * 为什么"按需":
-             *   软件 JPEG 编码要 65ms/帧 (占整帧 71ms 的 92%),
-             *   而 ESP32-S3 没有硬件 JPEG 编码器, 这个开销躲不掉。
-             *
-             *   但绝大多数时候【没有任何人在看远程流】(只有本机 LCD 预览),
-             *   这时候编码纯浪费 —— 还会把 CPU 占满, 导致 LCD 刷新卡顿、
-             *   触发看门狗, 间接造成画面撕裂。
-             *
-             * 所以: 只有真的有人拉流 (s_stream_clients > 0) 才编码。
-             *   本地使用: 0% 的编码开销, 预览流畅
-             *   远程推流: 正常编码, 约 13fps (受限于 CPU, 无法更高)
-             */
-            if (s_stream_clients > 0) {
-                int jpg_idx = -1;
-                if (slot_acquire(s_jpg_slots, &jpg_idx)) {
-                    int64_t t_enc = esp_timer_get_time();
-                    size_t jlen = encode_jpeg_to_slot(s_rgb_slots[rgb_idx].buf,
-                                                      fb->width, fb->height,
-                                                      s_jpg_slots[jpg_idx].buf);
-                    s_jpg_encode_us = (uint32_t)(esp_timer_get_time() - t_enc);
-
-                    if (jlen > 0) {
-                        s_jpg_slots[jpg_idx].len = jlen;
-                        s_jpg_bytes = (uint32_t)jlen;
-                        s_jpg_frames++;
-                        slot_publish(s_jpg_slots, jpg_idx);
-                    } else {
-                        slot_release(s_jpg_slots, jpg_idx);
-                    }
-                }
+                slot_publish(s_rgb_slots, rgb_idx);
             } else {
-                s_jpg_encode_us = 0;   /* 未编码 */
+                /* 没有空槽 (LCD 还没取走上一帧) -> 丢弃这一帧, 等下一帧 */
+                s_torn_frames++;
             }
+        }
 
-            slot_publish(s_rgb_slots, rgb_idx);
+        /*
+         * ---- 2) 按需编码 JPEG (给视频流用) ----
+         *
+         * 为什么"按需":
+         *   软件 JPEG 编码要 65ms/帧 (占整帧 71ms 的 92%),
+         *   而 ESP32-S3 没有硬件 JPEG 编码器, 这个开销躲不掉。
+         *
+         *   但绝大多数时候【没有任何人在看远程流】(只有本机 LCD 预览),
+         *   这时候编码纯浪费 —— 还会把 CPU 占满, 导致 LCD 刷新卡顿、
+         *   触发看门狗, 间接造成画面撕裂。
+         *
+         * 所以: 只有真的有人拉流 (s_stream_clients > 0) 才编码。
+         *   本地使用: 0% 的编码开销, 预览流畅
+         *   远程推流: 正常编码, 约 13fps (受限于 CPU, 无法更高)
+         *
+         * 编码直接吃 fb->buf (不再经过 RGB 槽位):
+         *   JPEG 编码输出到独立的 JPEG 槽位, 和 RGB 槽位互不干扰,
+         *   没必要再从 PSRAM 拷一份 153KB 出来。
+         */
+        if (need_jpg) {
+            int jpg_idx = -1;
+            if (slot_acquire(s_jpg_slots, &jpg_idx)) {
+                int64_t t_enc = esp_timer_get_time();
+                size_t jlen = encode_jpeg_to_slot(fb->buf,
+                                                  fb->width, fb->height,
+                                                  s_jpg_slots[jpg_idx].buf);
+                s_jpg_encode_us = (uint32_t)(esp_timer_get_time() - t_enc);
+
+                if (jlen > 0) {
+                    s_jpg_slots[jpg_idx].len = jlen;
+                    s_jpg_bytes = (uint32_t)jlen;
+                    s_jpg_frames++;
+                    slot_publish(s_jpg_slots, jpg_idx);
+                } else {
+                    slot_release(s_jpg_slots, jpg_idx);
+                }
+            }
+        } else {
+            s_jpg_encode_us = 0;   /* 未编码 */
         }
 
         esp_camera_fb_return(fb);
@@ -738,12 +2751,40 @@ static void camera_producer_task(void *arg)
             t0 = esp_timer_get_time();
         } else if (frames % 50 == 0) {
             int64_t dt_us = esp_timer_get_time() - t0;
-            ESP_LOGI(TAG, "PROD: %d frames (%.1f fps) | get %" PRIu32 "us copy %" PRIu32 "us jpeg %" PRIu32 "us | jpg %" PRIu32 " bytes | TORN %" PRIu32 "/%" PRIu32,
+            ESP_LOGI(TAG, "PROD: %d frames (%.1f fps) | get %" PRIu32 "us copy %" PRIu32 "us jpeg %" PRIu32 "us | jpg %" PRIu32 " bytes | DROP %" PRIu32,
                      frames, (frames - 1) * 1000000.0 / (double)dt_us,
                      s_cam_get_us, s_rgb_copy_us,
                      s_jpg_encode_us, s_jpg_bytes,
-                     s_torn_frames,
-                     (uint32_t)(s_torn_frames + s_clean_frames));
+                     s_torn_frames);
+            if (s_lcd_direct_draw) {
+                ESP_LOGI(TAG, "  LCD 直绘: %" PRIu32 " 帧, 最近一次 %" PRIu32 "us",
+                         s_lcd_direct_frames, s_lcd_draw_us);
+            }
+            if (s_noise_enabled) {
+                ESP_LOGI(TAG, "  噪点: rows %" PRIu32 "/%d  jumps %" PRIu32 "  energy %" PRIu32
+                         "  | hi(energy %" PRIu32 " jumps %" PRIu32 ")  lo(energy %" PRIu32 " jumps %" PRIu32 ")",
+                         s_noise_rows, NOISE_PROBE_ROWS,
+                         s_noise_jumps, s_noise_energy,
+                         s_bytes.hi_energy, s_bytes.hi_jumps,
+                         s_bytes.lo_energy, s_bytes.lo_jumps);
+            }
+        }
+
+        /*
+         * 周期性让出 CPU (喂看门狗)。
+         *
+         * 这个任务优先级 6 (最高), 一旦开始跑就会一直霸着 CPU,
+         * 因为 esp_camera_fb_get() 是【阻塞】的所以平时还好。
+         * 但一旦有人拉视频流, JPEG 编码 + PSRAM 拷贝连在一起,
+         * 就会出现 "IDLE0 跑不到 -> 看门狗超时 -> 板子重启"。
+         *
+         * 这里每 16 帧阻塞 1 tick, 相当于 24fps 下每 ~660ms 让一次,
+         * 保证 IDLE0 有机会喂狗。
+         *
+         * 注意: 用 tick 数而不是 pdMS_TO_TICKS(1) —— 后者在 100Hz 下是 0。
+         */
+        if ((frames % 16) == 0) {
+            vTaskDelay(APP_DELAY_TICKS);
         }
     }
 }
@@ -754,29 +2795,11 @@ static void camera_producer_task(void *arg)
  * 只从 RGB565 槽位取现成的帧, 不碰摄像头。
  * 降频到 ~2 fps —— LCD 预览是给老人自己看的"我在线"指示,
  * 不需要高帧率; 把 CPU 全留给远程视频流。
- */
-/*
- * LCD 显示模式 (运行时可切换, 用串口命令改, 不用反复编译烧录)
  *
- *   MODE_CAMERA  正常: 显示摄像头画面
- *   MODE_PATTERN 显示固定测试图样 (完全不碰摄像头)
- *   MODE_SYNTH   显示程序生成的合成渐变图 (走和摄像头一样的 draw_rgb565 路径)
- *
- * 为什么要有这个:
- *   "花屏" 有两种可能, 肉眼分不开:
- *     A) LCD/SPI 链路本身有问题 (批次边界错位, DMA 复用)
- *     B) 摄像头数据本身是乱的
- *   MODE_PATTERN 一开就能一刀切开: 图样也花 = A, 图样正常 = B。
- *   MODE_SYNTH 再进一步区分"画图代码路径"和"摄像头数据"。
+ * 注意: lcd1/lcd2 两个诊断模式也在这个任务里实现,
+ * 枚举 lcd_mode_t 的定义在文件前面 (s_lcd_direct_draw 旁边),
+ * 因为 camera_producer_task 也要用它来决定要不要让路。
  */
-typedef enum {
-    LCD_MODE_CAMERA = 0,
-    LCD_MODE_PATTERN = 1,
-    LCD_MODE_SYNTH = 2,
-} lcd_mode_t;
-
-static volatile lcd_mode_t s_lcd_mode = LCD_MODE_CAMERA;
-
 static void lcd_preview_task(void *arg)
 {
     while (true) {
@@ -793,12 +2816,23 @@ static void lcd_preview_task(void *arg)
             continue;
         }
 
+        /*
+         * 直绘模式 (s_lcd_direct_draw = true):
+         *   显示由 camera_producer_task 负责 (它手里一直握着帧缓冲,
+         *   画的时候不会被摄像头覆盖, 所以不会撕裂)。
+         *   这个任务就空转等待, 不要重复画。
+         */
+        if (s_lcd_direct_draw) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
         int idx = -1;
         size_t len = 0;
 
         if (slot_take_ready(s_rgb_slots, &idx, &len)) {
             /* 正常整屏显示 (真实产品路径) */
-            lcd_draw_rgb565(s_rgb_slots[idx].buf, 320 * 2, 0, 0, 320, 240, true);
+            lcd_draw_rgb565(s_rgb_slots[idx].buf, 320 * 2, 0, 0, 320, 240, true, true);
             slot_release(s_rgb_slots, idx);
         } else {
             vTaskDelay(pdMS_TO_TICKS(50));
@@ -808,43 +2842,24 @@ static void lcd_preview_task(void *arg)
     }
 }
 
-/* ---------------- JPEG 编码 (流式, 零额外拷贝) ---------------- */
+/* ---------------- JPEG 编码 (流式, 零额外拷贝, 带 CPU 让出点) ---------------- */
 
 /*
- * 用 frame2jpg_cb / fmt2jpg_cb 而不是 frame2jpg:
+ * 用 jpeg_encode_rgb565_yield() 而不是 frame2jpg:
  *   frame2jpg     每帧 malloc 128KB -> 编码 -> memcpy 到缓冲 -> free
  *                 在 PSRAM 上反复大块分配/释放, 既慢又引起碎片
  *   fmt2jpg_cb    编码器直接把 512 字节一块的数据推给回调, 我们顺手写进
  *                 预分配的槽位, 没有额外拷贝, 也没有每帧 malloc
+ *                 但【不让出 CPU】 -> 看门狗超时 -> 板子重启 (见下)
  *
- * fmt2jpg_cb 支持 PIXFORMAT_RGB565 输入, to_jpg.cpp 内部会逐行展开成
- * RGB888 (用的是一个行缓冲区, 不是整帧中间缓冲), 然后 jpge 再转 YCC。
- * 所以直接喂 RGB565, 不要自己先展开成整帧 RGB888 —— 那会多占 230KB。
+ * jpeg_encode_rgb565_yield 是我们自己写的第三种:
+ *   编码结果和 fmt2jpg_cb 一模一样 (同样 jpge 参数, 同样的行转换),
+ *   区别是每 16 行主动让出一次 CPU。
+ *
+ * 支持 RGB565 输入, 内部逐行展开成 RGB888 (用行缓冲区, 不是整帧中间缓冲),
+ * 然后 jpge 再转 YCC。所以直接喂 RGB565, 不要自己先展开成整帧 RGB888
+ * —— 那会多占 230KB。
  */
-typedef struct {
-    uint8_t *dst;
-    size_t   cap;
-    size_t   written;
-} jpg_sink_t;
-
-/*
- * 回调返回实际写入的字节数; 返回 0 表示写满了, jpge 会停止继续输出。
- * 注意 jpge 用返回值累加 index, 所以这里必须返回实际写入量。
- */
-static size_t jpg_sink_cb(void *arg, size_t index, const void *data, size_t len)
-{
-    jpg_sink_t *sink = (jpg_sink_t *)arg;
-
-    if (index + len > sink->cap) {
-        len = sink->cap - index;   /* 写满就截断 */
-        if (len == 0) {
-            return 0;
-        }
-    }
-    memcpy(sink->dst + index, data, len);
-    sink->written = index + len;
-    return len;
-}
 
 /*
  * 把一帧 RGB565 编码成 JPEG, 写进 dst。
@@ -852,20 +2867,50 @@ static size_t jpg_sink_cb(void *arg, size_t index, const void *data, size_t len)
  *
  * 注意: 摄像头帧缓冲是大端 (高位字节在前), jpge 默认 rgb565_big_endian = true,
  * 与我们的帧缓冲格式一致, 不用做字节交换。
+ *
+ * ---------------------------------------------------------------------------
+ * 为什么不用 fmt2jpg_cb:
+ *   fmt2jpg_cb() 是 esp32-camera 的黑盒, 它在 convert_image() 里一口气把
+ *   240 行全部编码完, 中间【不让出 CPU】。实测一次要 69ms。
+ *
+ *   后果 (串口日志实锤):
+ *     E task_wdt: Task watchdog got triggered.
+ *     E task_wdt:  - IDLE0 (CPU 0)
+ *     E task_wdt: CPU 0: cam_producer
+ *   -> core 0 的空闲任务喂不了看门狗 -> 板子反复重启
+ *   -> 同时 prio 2 的 LCD 任务被饿死 -> 屏幕卡住 -> 看起来在闪花屏
+ *
+ * 所以改用 jpeg_encode_rgb565_yield(): 同样的编码结果,
+ * 但每 16 行主动让出一次 CPU。
  */
+static void jpeg_encode_yield_cb(void *arg)
+{
+    (void)arg;
+    /*
+     * 这里必须【阻塞】, 不能只 taskYIELD()。
+     *
+     * taskYIELD() 只是把 CPU 让给同优先级的就绪任务, 自己马上又跑起来。
+     * 而看门狗要复位的是 IDLE0 (优先级最低), 只有当编码任务真正
+     * 阻塞时, IDLE0 才有机会跑起来喂狗。
+     *
+     * 陷阱: 不能写 pdMS_TO_TICKS(1)! tick 率是 100Hz, 1ms 不足一个 tick,
+     *       pdMS_TO_TICKS(1) 会算成 0, vTaskDelay(0) 退化成 taskYIELD(),
+     *       让出点等于没加 (编码耗时还是 69ms, 看门狗照样超时)。
+     *       必须直接用 tick 数: vTaskDelay(1) = 10ms。
+     */
+    vTaskDelay(APP_DELAY_TICKS);
+}
+
 static size_t encode_jpeg_to_slot(const uint8_t *rgb565, int w, int h, uint8_t *dst)
 {
-    jpg_sink_t sink = {
-        .dst = dst,
-        .cap = JPEG_SLOT_BYTES,
-        .written = 0,
-    };
+    size_t written = 0;
 
-    if (!fmt2jpg_cb((uint8_t *)rgb565, (size_t)w * h * 2, (uint16_t)w, (uint16_t)h,
-                    PIXFORMAT_RGB565, JPEG_QUALITY, jpg_sink_cb, &sink)) {
+    if (!jpeg_encode_rgb565_yield(rgb565, w, h, JPEG_QUALITY,
+                                  dst, JPEG_SLOT_BYTES, &written,
+                                  jpeg_encode_yield_cb, NULL, JPEG_YIELD_EVERY_ROWS)) {
         return 0;
     }
-    return sink.written;
+    return written;
 }
 
 
@@ -993,6 +3038,58 @@ static esp_err_t notify_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/*
+ * /raw —— 导出【原始 RGB565】帧 (取证用)。
+ *
+ * 为什么要这个端点:
+ *   /stream 给的是 JPEG, 而 JPEG 会把噪点平滑掉, 根本看不出画面脏在哪。
+ *   只有拿到未编码的原始 RGB565, 才能在电脑上逐字节分析:
+ *   哪些字节被污染、是整行错位还是逐像素跳变、是不是半个像素的错位。
+ *
+ * 用法:
+ *   GET /raw          -> 返回最近抓的一帧原始 RGB565 (153600 字节, 二进制)
+ *   GET /raw?capture  -> 先请求抓一帧, 再返回
+ */
+static esp_err_t raw_handler(httpd_req_t *req)
+{
+    if (s_raw_snapshot == NULL) {
+        httpd_resp_sendstr(req, "raw snapshot buffer not allocated");
+        return ESP_OK;
+    }
+
+    /* 带了 capture 参数 = 先等一帧新的 */
+    char query[64] = {0};
+    if (httpd_req_get_url_query_len(req) > 0 &&
+        httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        if (strstr(query, "capture") != NULL) {
+            /*
+             * 【BUG 修复】原来只看 s_raw_snapshot_ready 这个标志,
+             * 而它可能是上一轮留下的 1, 于是循环立刻退出,
+             * 返回的是【旧帧】。这就是之前取证全部作废的原因。
+             *
+             * 正确做法: 记住当前序号, 等到序号【变大】才算抓到了新帧。
+             */
+            uint32_t seq_before = s_raw_snapshot_seq;
+            s_raw_capture_requested = true;
+            /* 等生产者抓帧 (最多 2 秒) */
+            for (int i = 0; i < 200; i++) {
+                if (s_raw_snapshot_seq != seq_before) {
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            s_raw_snapshot_ready = 0;
+            ESP_LOGI(TAG, "RAW: 序号 %" PRIu32 " -> %" PRIu32,
+                     (uint32_t)seq_before, (uint32_t)s_raw_snapshot_seq);
+        }
+    }
+
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=raw.rgb565");
+    httpd_resp_send(req, (const char *)s_raw_snapshot, RAW_SNAPSHOT_BYTES);
+    return ESP_OK;
+}
+
 static esp_err_t health_handler(httpd_req_t *req)
 {
     esp_netif_ip_info_t ip;
@@ -1005,7 +3102,12 @@ static esp_err_t health_handler(httpd_req_t *req)
              "\"cam_frames\":%" PRIu32 ",\"jpg_frames\":%" PRIu32 ",\"jpg_bytes\":%" PRIu32 ","
              "\"cam_get_us\":%" PRIu32 ",\"rgb_copy_us\":%" PRIu32 ",\"jpg_encode_us\":%" PRIu32 ","
              "\"torn_frames\":%" PRIu32 ","
-             "\"jpeg_quality\":%d,\"max_fps\":%" PRIu32 "}",
+             "\"lcd_direct\":%s,\"lcd_draw_us\":%" PRIu32 ",\"lcd_frames\":%" PRIu32 ","
+             "\"noise_rows\":%" PRIu32 ",\"noise_avg\":%" PRIu32 ","
+             "\"hi_energy\":%" PRIu32 ",\"lo_energy\":%" PRIu32 ","
+             "\"hi_jumps\":%" PRIu32 ",\"lo_jumps\":%" PRIu32 ",\"bad_rows\":%" PRIu32 ","
+             "\"jpeg_quality\":%d,\"max_fps\":%" PRIu32 ","
+             "\"audio_ready\":%s,\"audio_rate\":%d}",
              IP2STR(&ip.ip),
              (unsigned long long)(esp_timer_get_time() / 1000),
              (uint32_t)s_frame_count,
@@ -1018,11 +3120,253 @@ static esp_err_t health_handler(httpd_req_t *req)
              (uint32_t)s_rgb_copy_us,
              (uint32_t)s_jpg_encode_us,
              (uint32_t)s_torn_frames,
+             s_lcd_direct_draw ? "true" : "false",
+             s_lcd_draw_us,
+             s_lcd_direct_frames,
+             s_noise_rows,
+             s_noise_frames ? (s_noise_rows_total / s_noise_frames) : 0,
+             s_hi_energy,
+             s_lo_energy,
+             s_hi_jumps,
+             s_lo_jumps,
+             s_bad_rows,
              JPEG_QUALITY,
-             (uint32_t)(s_jpg_encode_us > 0 ? 1000000 / s_jpg_encode_us : 0));
+             (uint32_t)(s_jpg_encode_us > 0 ? 1000000 / s_jpg_encode_us : 0),
+             audio_board_is_ready() ? "true" : "false",
+             AUDIO_SAMPLE_RATE);
 
     httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+/*
+ * ==================== 音频传输链路 ====================
+ *
+ * 需求文档 3.6 的规定:
+ *   上行 (老人麦克风 -> 云): G.711 A-law 16kHz 单声道, 20ms 一包 (320 字节)
+ *   下行 (云 -> 设备喇叭):    PCM16 16kHz 单声道, 20ms 一包 (640 字节)
+ *
+ * 这里用 HTTP 实现 (WSS 那套要等联网阶段), 端点设计:
+ *
+ *   GET  /audio/alaw    上行流: G.711 A-law 16k 单声道, 裸字节流
+ *                       (Content-Type: audio/basic, 每 20ms 一包)
+ *                       这是最接近正式链路的形式 —— 客户端拿到就能直接喂给
+ *                       播放器或转码器。
+ *
+ *   GET  /audio/pcm     下行流: PCM16 16k 单声道 (audio/L16)
+ *                       客户端 POST 过来的语音通过 /audio/down 灌进来,
+ *                       这里负责从设备喇叭播出来。
+ *
+ *   POST /audio/down    下行注入: body 是 PCM16 16k 单声道, 立即播放
+ *                       这是"按住说话"的落地方式 —— 客户端一边 POST 一边
+ *                       设备一边播, 天然半双工。
+ *
+ *   GET  /audio/level   读当前录音电平 (JSON), 调试用
+ *
+ * 半双工互斥:
+ *   下行播放期间, 上行流会被静音 (audio_board_set_downlink_active),
+ *   避免喇叭回声被麦克风拾回去 —— 这是啸叫的直接来源。
+ */
+
+/* 每次 20ms @16kHz = 320 帧 */
+#define AUDIO_PKT_FRAMES   320
+
+/*
+ * GET /audio/alaw —— 上行 G.711 A-law 流
+ */
+static esp_err_t audio_alaw_handler(httpd_req_t *req)
+{
+    if (!audio_board_is_ready()) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "audio not ready");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "audio/basic");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    /* 告诉客户端这是 8bit A-law, 16kHz, 单声道 */
+    httpd_resp_set_hdr(req, "X-Audio-Format", "g711-alaw;rate=16000;channels=1");
+
+    int16_t *pcm = heap_caps_malloc(AUDIO_PKT_FRAMES * sizeof(int16_t),
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *alaw = heap_caps_malloc(AUDIO_PKT_FRAMES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (pcm == NULL || alaw == NULL) {
+        free(pcm);
+        free(alaw);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no memory");
+        return ESP_FAIL;
+    }
+
+    while (1) {
+        int n = audio_board_read_mono(pcm, AUDIO_PKT_FRAMES);
+        if (n <= 0) {
+            /* 环形缓冲暂时空了, 等 20ms 再试 */
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        g711_alaw_encode_block(pcm, alaw, n);
+
+        esp_err_t ret = httpd_resp_send_chunk(req, (const char *)alaw, n);
+        if (ret != ESP_OK) {
+            break;      /* 客户端断开 */
+        }
+
+        /*
+         * 按真实速率限速: n 帧 @16kHz = n/16 ms。
+         * 不限速的话会瞬间把环形缓冲抽干, 上游没数据可发, 客户端收到断流。
+         */
+        vTaskDelay(pdMS_TO_TICKS((n * 1000) / AUDIO_SAMPLE_RATE));
+    }
+
+    free(pcm);
+    free(alaw);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+/*
+ * POST /audio/down —— 下行注入 (PCM16 16k 单声道), 立即播放
+ *
+ * 客户端"按住说话"时持续 POST, 设备这边持续播 —— 半双工。
+ */
+static esp_err_t audio_down_handler(httpd_req_t *req)
+{
+    if (!audio_board_is_ready()) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "audio not ready");
+        return ESP_FAIL;
+    }
+
+    int total = req->content_len;
+    if (total <= 0) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"empty body\"}");
+        return ESP_FAIL;
+    }
+
+    audio_board_set_downlink_active(true);
+
+    int16_t *pcm = heap_caps_malloc(AUDIO_PKT_FRAMES * sizeof(int16_t),
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (pcm == NULL) {
+        audio_board_set_downlink_active(false);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no memory");
+        return ESP_FAIL;
+    }
+
+    int played_frames = 0;
+    int received = 0;
+
+    while (received < total) {
+        int want = total - received;
+        if (want > AUDIO_PKT_FRAMES * (int)sizeof(int16_t)) {
+            want = AUDIO_PKT_FRAMES * (int)sizeof(int16_t);
+        }
+
+        int got = httpd_req_recv(req, (char *)pcm, want);
+        if (got <= 0) {
+            if (got == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;   /* 只是超时, 客户端可能还在发 */
+            }
+            break;          /* 真断开 */
+        }
+
+        int frames = got / (int)sizeof(int16_t);
+        audio_board_play_mono(pcm, frames);
+        played_frames += frames;
+        received += got;
+
+        /*
+         * 限速: 按实际播放的帧数延时, 让 I2S TX 有时间消化。
+         * 不限速会一次灌太多, i2s_channel_write 超时。
+         */
+        vTaskDelay(pdMS_TO_TICKS((frames * 1000) / AUDIO_SAMPLE_RATE));
+    }
+
+    free(pcm);
+    audio_board_set_downlink_active(false);
+
+    /*
+     * 注意: ESP-IDF 的 httpd 响应体【只能发一次】。
+     * 第一次 httpd_resp_sendstr() 会锁定响应 (设置 Content-Length 并标记
+     * 已发送), 后续的调用会被静默丢弃 —— 结果就是客户端收到
+     * '{"ok":true,"played_frames":' 这种被截断的 JSON。
+     *
+     * 所以必须拼成完整的一段再一次性发出去。
+     */
+    char resp[64];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"played_frames\":%d}", played_frames);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+/*
+ * GET /audio/level —— 当前录音电平 (JSON)
+ */
+static esp_err_t audio_level_handler(httpd_req_t *req)
+{
+    audio_board_stats_t st;
+    memset(&st, 0, sizeof(st));
+    audio_board_get_stats(&st);
+
+    char resp[192];
+    snprintf(resp, sizeof(resp),
+             "{\"peak\":%u,\"rms\":%u,\"speaking\":%s,\"samples\":%u,"
+             "\"frames\":%u,\"rate\":%d,\"downlink\":%s}",
+             (unsigned)st.peak, (unsigned)st.rms,
+             st.speaking ? "true" : "false",
+             (unsigned)st.samples, (unsigned)st.frames,
+             AUDIO_SAMPLE_RATE,
+             audio_board_is_downlink_active() ? "true" : "false");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+/*
+ * GET /audio/pcm —— 保留的原始 PCM 流 (双声道 L16), 调试用。
+ * 正式上行用 /audio/alaw (单声道 + G.711, 带宽减半)。
+ */
+static esp_err_t audio_handler(httpd_req_t *req)
+{
+    if (!audio_board_is_ready()) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "audio not ready");
+        return ESP_FAIL;
+    }
+
+    char hdr[128];
+    snprintf(hdr, sizeof(hdr), "audio/L16; rate=%d; channels=2", AUDIO_SAMPLE_RATE);
+    httpd_resp_set_type(req, hdr);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    /* 每次发 20ms 的数据 (320 帧 @16kHz = 1280 字节) */
+    const int chunk_frames = 320;
+    int16_t *buf = heap_caps_malloc(chunk_frames * 4, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (buf == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no memory");
+        return ESP_FAIL;
+    }
+
+    /* 客户端断开时 httpd 会让 send 返回错误, 循环退出 */
+    while (1) {
+        int n = audio_board_read(buf, chunk_frames);
+        if (n <= 0) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        char range[64];
+        snprintf(range, sizeof(range), "%d", n * 4);
+        httpd_resp_set_hdr(req, "Content-Length", range);
+
+        esp_err_t ret = httpd_resp_send_chunk(req, (const char *)buf, n * 4);
+        if (ret != ESP_OK) {
+            break;      /* 客户端断开 */
+        }
+    }
+
+    free(buf);
+    httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
@@ -1030,8 +3374,17 @@ static void http_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_PORT;
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 12;
     config.stack_size = 10240;
+    /*
+     * 钉到 core 0 —— 和 cam_task / 其它任务同核。
+     *
+     * 原因: httpd 的 stream_handler 会读 PSRAM 里的 JPEG 槽位。
+     * ESP32-S3 的 PSRAM 缓存每核独立, 如果 httpd 跑在 core 1,
+     * 它读到的可能是 core 0 写入前的陈旧缓存 -> 浏览器端画面撕裂。
+     * 之前"浏览器干净、LCD 花屏"就是任务分散在不同核上的结果。
+     */
+    config.core_id = APP_CORE_ID;
 
     httpd_handle_t server = NULL;
     esp_err_t ret = httpd_start(&server, &config);
@@ -1045,14 +3398,25 @@ static void http_server_start(void)
     httpd_uri_t ev = { .uri = "/event", .method = HTTP_GET, .handler = event_handler, .user_ctx = NULL };
     httpd_uri_t notify = { .uri = "/notify", .method = HTTP_POST, .handler = notify_handler, .user_ctx = NULL };
     httpd_uri_t health = { .uri = "/health", .method = HTTP_GET, .handler = health_handler, .user_ctx = NULL };
+    httpd_uri_t raw = { .uri = "/raw", .method = HTTP_GET, .handler = raw_handler, .user_ctx = NULL };
+    httpd_uri_t audio = { .uri = "/audio", .method = HTTP_GET, .handler = audio_handler, .user_ctx = NULL };
+    httpd_uri_t audio_alaw = { .uri = "/audio/alaw", .method = HTTP_GET, .handler = audio_alaw_handler, .user_ctx = NULL };
+    httpd_uri_t audio_down = { .uri = "/audio/down", .method = HTTP_POST, .handler = audio_down_handler, .user_ctx = NULL };
+    httpd_uri_t audio_level = { .uri = "/audio/level", .method = HTTP_GET, .handler = audio_level_handler, .user_ctx = NULL };
 
     httpd_register_uri_handler(server, &root);
     httpd_register_uri_handler(server, &stream);
     httpd_register_uri_handler(server, &ev);
     httpd_register_uri_handler(server, &notify);
     httpd_register_uri_handler(server, &health);
+    httpd_register_uri_handler(server, &raw);
+    httpd_register_uri_handler(server, &audio);
+    httpd_register_uri_handler(server, &audio_alaw);
+    httpd_register_uri_handler(server, &audio_down);
+    httpd_register_uri_handler(server, &audio_level);
 
     ESP_LOGI(TAG, "HTTP 服务器已启动，端口 %d", HTTP_PORT);
+    ESP_LOGI(TAG, "音频端点: /audio/alaw (上行G711) /audio/down (下行PCM) /audio/level (电平)");
 }
 
 /* ---------------- 任务创建辅助 ---------------- */
@@ -1062,6 +3426,9 @@ static void http_server_start(void)
  * FreeRTOS 默认从内部 RAM 分任务栈，很容易 xTaskCreate 失败
  * (errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY = -1)。
  * 所以这里显式从 PSRAM 分配栈，再手动建任务。
+ *
+ * 全部任务钉在 core 0 (APP_CORE_ID), 原因见 APP_CORE_ID 的注释:
+ * 保证和 cam_task 共用同一份 PSRAM 缓存, 否则读到陈旧帧 -> 花屏。
  */
 static void task_start(void *fn, const char *name, uint32_t stack_bytes, UBaseType_t prio)
 {
@@ -1088,15 +3455,15 @@ static void task_start(void *fn, const char *name, uint32_t stack_bytes, UBaseTy
         return;
     }
 
-    TaskHandle_t handle = xTaskCreateStatic((TaskFunction_t)fn, name, stack_bytes,
-                                            NULL, prio, stack, tcb);
+    TaskHandle_t handle = xTaskCreateStaticPinnedToCore((TaskFunction_t)fn, name, stack_bytes,
+                                                        NULL, prio, stack, tcb, APP_CORE_ID);
     if (handle == NULL) {
         ESP_LOGE(TAG, "任务 %s 创建失败", name);
         heap_caps_free(stack);
         heap_caps_free(tcb);
         return;
     }
-    ESP_LOGI(TAG, "任务 %s 已启动", name);
+    ESP_LOGI(TAG, "任务 %s 已启动 (core %d)", name, APP_CORE_ID);
 }
 
 /* ---------------- Wi-Fi 重连任务 (带退避) ---------------- */
@@ -1152,19 +3519,418 @@ static void aw9523b_diag_task(void *arg)
     }
 }
 
+/*
+ * ==================== Wi-Fi 扫描 (排障/选网用) ====================
+ *
+ * 为什么必须有这个:
+ *   电脑的 netsh 只能看到 5GHz 的 "WMU-EDU" (信道 52), 而 ESP32-S3
+ *   只支持 2.4GHz —— 所以板子连不上, 但我们不知道附近到底有没有
+ *   同名的 2.4GHz BSSID, 也不知道还有哪些 2.4GHz 网络可用。
+ *
+ *   让板子自己扫一遍, 是唯一可靠的办法 —— 它的射频和 PC 不一样。
+ *
+ * 用法: 串口命令 "scan"
+ */
+
+static void wifi_scan_and_report(void)
+{
+    /*
+     * Wi-Fi 没开的话, 现场初始化射频 (只 start, 不 connect)。
+     * 这样即使固件是 WIFI_ENABLE=0 的诊断状态, 也能随时扫网。
+     */
+    {
+        wifi_mode_t mode = WIFI_MODE_NULL;
+        if (esp_wifi_get_mode(&mode) != ESP_OK || mode == WIFI_MODE_NULL) {
+            ESP_LOGI(TAG, "Wi-Fi 未初始化, 现在启动射频 (仅扫描)");
+            wifi_scan_init();
+        }
+    }
+
+    wifi_scan_config_t scan_cfg = {
+        .show_hidden = false,
+        .scan_type   = WIFI_SCAN_TYPE_ACTIVE,
+        /*
+         * 每信道扫描时间。active 模式 min=0/max=120ms 是 IDF 默认值,
+         * 但对"找出信号最强的那个"来说偏短 —— 主动探测要等 AP 的
+         * Probe Response, 信道切换多的时候容易漏。这里放宽一点。
+         */
+        .scan_time = {
+            .active = { .min = 60, .max = 200 },
+            .passive = 300,
+        },
+    };
+
+    ESP_LOGI(TAG, "开始扫描 2.4GHz Wi-Fi (最多 8 秒)...");
+
+    esp_err_t ret = esp_wifi_scan_start(&scan_cfg, true);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "扫描启动失败: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    uint16_t found = 0;
+    ret = esp_wifi_scan_get_ap_num(&found);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "读取扫描结果数量失败: %s", esp_err_to_name(ret));
+        return;
+    }
+    if (found == 0) {
+        ESP_LOGW(TAG, "附近没有扫描到任何 2.4GHz 网络");
+        return;
+    }
+
+    ESP_LOGI(TAG, "扫描到 %u 个 2.4GHz 网络:", found);
+
+    /* ap_info_t 每个约 100 字节, 20 个就 2KB, 放堆上 */
+    wifi_ap_record_t *recs = heap_caps_malloc(found * sizeof(wifi_ap_record_t),
+                                              MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (recs == NULL) {
+        ESP_LOGE(TAG, "扫描结果缓冲分配失败 (%u 字节)", (unsigned)(found * sizeof(wifi_ap_record_t)));
+        return;
+    }
+
+    ret = esp_wifi_scan_get_ap_records(&found, recs);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "读取扫描记录失败: %s", esp_err_to_name(ret));
+        free(recs);
+        return;
+    }
+
+    /* 按信号强度排序, 最强的排前面 */
+    for (int i = 0; i < found; i++) {
+        for (int j = i + 1; j < found; j++) {
+            if (recs[j].rssi > recs[i].rssi) {
+                wifi_ap_record_t t = recs[i];
+                recs[i] = recs[j];
+                recs[j] = t;
+            }
+        }
+    }
+
+    for (int i = 0; i < found && i < 20; i++) {
+        const char *auth = "OPEN";
+        switch (recs[i].authmode) {
+        case WIFI_AUTH_WPA_WPA2_PSK: auth = "WPA2"; break;
+        case WIFI_AUTH_WPA2_PSK:     auth = "WPA2"; break;
+        case WIFI_AUTH_WPA3_PSK:     auth = "WPA3"; break;
+        case WIFI_AUTH_WPA2_ENTERPRISE: auth = "WPA2-ENT"; break;
+        case WIFI_AUTH_WPA_ENTERPRISE:      auth = "WPA-ENT"; break;
+        default: break;
+        }
+        ESP_LOGI(TAG, "  [%2d] %-24s ch%-3d %4d dBm  %s  %s",
+                 i,
+                 (char *)recs[i].ssid,
+                 recs[i].primary,
+                 recs[i].rssi,
+                 auth,
+                 (i == 0) ? "<- 最强" : "");
+    }
+
+    free(recs);
+}
+
+/* ---------------- 板载自环测试 ---------------- */
+
+/*
+ * 在板子内部完整跑一遍音频传输链路, 不需要外部电脑。
+ *
+ * 背景: 校园网 (WMU-EDU) 开了客户端隔离, PC 访问板子的 IP 会被丢包,
+ * 所以"PC 抓流 -> PC 灌流"这种外部测试做不了。但链路本身在板子上
+ * 是通的 —— 板子访问自己的 127.0.0.1:8080 完全正常。
+ *
+ * 所以让板子自己当客户端:
+ *   1) 开一个 http client 连 http://127.0.0.1:8080/audio/alaw
+ *      -> 验证 G.711 上行端点真的在吐数据, 且字节流可解码
+ *   2) 把收到的 A-law 数据在板子上解码回 PCM
+ *      -> 验证"编码 -> 网络 -> 解码"整条路的数据完整性
+ *   3) 开一个 http client POST PCM 到 http://127.0.0.1:8080/audio/down
+ *      -> 验证下行端点真的接收并播放
+ *
+ * 用法: 串口命令 "axtest"
+ */
+static void audio_selftest_loop(void)
+{
+#if !WIFI_ENABLE
+    ESP_LOGE(TAG, "自环测试需要 Wi-Fi (自环也要走 TCP/IP 协议栈)");
+    return;
+#else
+    esp_netif_ip_info_t ip;
+    if (esp_netif_get_ip_info(s_netif, &ip) != ESP_OK || ip.ip.addr == 0) {
+        ESP_LOGE(TAG, "自环测试需要先连上 Wi-Fi (当前没 IP)");
+        return;
+    }
+
+    char host[32];
+    /*
+     * 注意: esp_ip4_addr_t.addr 已经是网络字节序, 不能按字节拆开打印 ——
+     * 我第一版写成 (addr >> 24) & 0xFF, 结果把 172.72.49.211 打成了
+     * 211.49.72.172。用 IP2STR 宏, 它会正确处理字节序。
+     */
+    snprintf(host, sizeof(host), IPSTR, IP2STR(&ip.ip));
+    ESP_LOGI(TAG, "自环测试开始 (目标 %s:8080)", host);
+
+    /* ---------- 步骤 1+2: 上行 G.711 链路 ---------- */
+    {
+        esp_http_client_config_t cfg = {
+            .url = "http://127.0.0.1:8080/audio/alaw",
+            .timeout_ms = 10000,
+        };
+        esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+        if (cli == NULL) {
+            ESP_LOGE(TAG, "自环: http client 初始化失败");
+            return;
+        }
+
+        esp_err_t ret = esp_http_client_open(cli, 0);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "自环: 连接 /audio/alaw 失败 (%s)", esp_err_to_name(ret));
+            esp_http_client_cleanup(cli);
+            return;
+        }
+
+        int total_alaw = 0;
+        int total_pcm  = 0;
+        int peak       = 0;
+        long long sum_sq = 0;
+
+        /*
+         * 缓冲必须放堆上, 不能放栈上!
+         * 这个函数是在 uart_cmd 任务里调的, 那个任务栈只有 4096 字节,
+         * 两个 1KB 的数组 + esp_http_client 自己的栈就爆了
+         * (实测直接 stack overflow 重启)。
+         */
+        uint8_t *buf = heap_caps_malloc(512, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        int16_t *pcm = heap_caps_malloc(512 * sizeof(int16_t),
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (buf == NULL || pcm == NULL) {
+            ESP_LOGE(TAG, "自环: 缓冲分配失败");
+            free(buf);
+            free(pcm);
+            esp_http_client_close(cli);
+            esp_http_client_cleanup(cli);
+            return;
+        }
+
+        uint32_t start = esp_timer_get_time();
+
+        /*
+         * 【修复】原来这里没调 esp_http_client_fetch_headers, 直接就
+         * esp_http_client_read。/audio/alaw 是 chunked 响应 (httpd_resp_send_chunk),
+         * 响应头没解析出来时 client->response->is_chunked 还是 0,
+         * content_length 也是 0 -> read 认为"没有数据", 立刻返回 0,
+         * 于是自环[上行] 永远收到 0 字节。
+         *
+         * 必须先 fetch_headers 把响应头解析完, 才知道这是 chunked 流。
+         */
+        int64_t hdr = esp_http_client_fetch_headers(cli);
+        if (hdr < 0) {
+            ESP_LOGE(TAG, "自环[上行]: 取响应头失败 (%d)", (int)hdr);
+            esp_http_client_close(cli);
+            esp_http_client_cleanup(cli);
+            free(buf);
+            free(pcm);
+            return;
+        }
+        ESP_LOGI(TAG, "自环[上行]: 响应头 OK (content_length=%lld)",
+                 (long long)esp_http_client_get_content_length(cli));
+
+        while (total_alaw < 16000) {   /* 收 1 秒的数据 */
+            int n = esp_http_client_read(cli, (char *)buf, 512);
+            if (n <= 0) {
+                break;
+            }
+            total_alaw += n;
+
+            /* 在板子上解码回来 —— 验证数据没被损坏 */
+            g711_alaw_decode_block(buf, pcm, n);
+            for (int i = 0; i < n; i++) {
+                int v = pcm[i];
+                if (v < 0) v = -v;
+                if (v > peak) peak = v;
+                sum_sq += (long long)pcm[i] * pcm[i];
+            }
+            total_pcm += n;
+        }
+        uint32_t elapsed_us = (uint32_t)(esp_timer_get_time() - start);
+        esp_http_client_close(cli);
+        esp_http_client_cleanup(cli);
+        free(buf);
+        free(pcm);
+
+        int rms = (total_pcm > 0) ? (int)(sqrt((double)sum_sq / total_pcm)) : 0;
+
+        ESP_LOGI(TAG, "自环[上行]: 收到 %d 字节 A-law, 解码 %d 个 PCM 样本, 耗时 %u ms",
+                 total_alaw, total_pcm, (unsigned)(elapsed_us / 1000));
+        ESP_LOGI(TAG, "自环[上行]: 解码后 peak=%d rms=%d, 实际码率 %lld 字节/秒",
+                 peak, rms, (long long)total_alaw * 1000000LL / (elapsed_us ? elapsed_us : 1));
+
+        if (total_alaw == 0) {
+            ESP_LOGE(TAG, "自环[上行] 失败: 一个字节都没收到");
+        } else {
+            /*
+             * 16000 字节/秒 是设计值 (16kHz 单声道 G.711), 允许 20% 偏差。
+             *
+             * 【2026-11-03 修正】用 long long 算码率。
+             * 原来写的是 total_alaw * 1000000, total_alaw 是 int,
+             * 乘 1000000 会溢出 int32 (16000 * 1000000 = 1.6e10 早就爆了),
+             * 除完再转 int 得到一个完全错误的数 —— 实测报"2008 字节/秒",
+             * 实际是 16384 字节 / 1069 ms = 15326 字节/秒, 接近 16000, 链路是好的。
+             */
+            long long rate = (long long)total_alaw * 1000000LL /
+                             (elapsed_us ? elapsed_us : 1);
+            if (rate > 12800 && rate < 19200) {
+                ESP_LOGI(TAG, "自环[上行] 通过: 码率 %lld 字节/秒 (设计 16000)", rate);
+            } else {
+                ESP_LOGW(TAG, "自环[上行] 码率异常: %lld 字节/秒 (期望 16000 附近)", rate);
+            }
+            if (peak > 0) {
+                ESP_LOGI(TAG, "自环[上行] 音频非静音 (peak=%d) —— 麦克风在拾音", peak);
+            } else {
+                ESP_LOGW(TAG, "自环[上行] 解码后全零 —— 可能是安静环境, 也可能是没采到音");
+            }
+        }
+    }
+
+    /* ---------- 步骤 3: 下行链路 ---------- */
+    {
+        /*
+         * 造 1 秒的 440Hz 正弦波 (16kHz 单声道 PCM16),
+         * POST 到 /audio/down, 设备应该把它播出来。
+         */
+        const int frames = 16000;
+        /*
+         * 1 秒单声道 PCM16 = 32KB。放 PSRAM —— 内部 RAM 只剩 28KB,
+         * 放内部必然分配失败 (这正是之前"下行: 缓冲分配失败"的原因)。
+         * 这块数据只是喂给 http client, 不参与 DMA, PSRAM 完全没问题。
+         */
+        int16_t *pcm = heap_caps_malloc(frames * sizeof(int16_t),
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (pcm == NULL) {
+            ESP_LOGE(TAG, "自环[下行]: 缓冲分配失败");
+            return;
+        }
+        for (int i = 0; i < frames; i++) {
+            double ph = 2.0 * 3.14159265358979 * 440.0 * i / AUDIO_SAMPLE_RATE;
+            pcm[i] = (int16_t)(sin(ph) * 10000);
+        }
+
+        esp_http_client_config_t cfg = {
+            .url = "http://127.0.0.1:8080/audio/down",
+            .timeout_ms = 15000,
+            .method = HTTP_METHOD_POST,
+        };
+        esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+        if (cli == NULL) {
+            ESP_LOGE(TAG, "自环[下行]: http client 初始化失败");
+            free(pcm);
+            return;
+        }
+
+        esp_err_t ret = esp_http_client_open(cli, frames * sizeof(int16_t));
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "自环[下行]: 连接失败 (%s)", esp_err_to_name(ret));
+            esp_http_client_cleanup(cli);
+            free(pcm);
+            return;
+        }
+
+        /* 分块发送, 每块 640 字节 = 20ms (需求文档规定的一包大小) */
+        int sent = 0;
+        const int chunk = 640;
+        while (sent < frames * (int)sizeof(int16_t)) {
+            int want = (frames * (int)sizeof(int16_t)) - sent;
+            if (want > chunk) want = chunk;
+            int w = esp_http_client_write(cli, (const char *)&pcm[sent / 2], want);
+            if (w < 0) {
+                ESP_LOGE(TAG, "自环[下行]: 发送失败");
+                break;
+            }
+            sent += w;
+        }
+
+        /*
+         * 【2026-11-03 修正】
+         * 原来这里直接 esp_http_client_get_status_code(cli) 就完事,
+         * 但 POST 完 body 之后响应头还没被解析, status_code 还是初始值 0,
+         * 于是判断 "status == 200" 永远不成立 -> 误报"下行失败"。
+         * 必须先 fetch_headers 把响应头读出来, 再取状态码。
+         */
+        int64_t hdr2 = esp_http_client_fetch_headers(cli);
+        int status = esp_http_client_get_status_code(cli);
+        ESP_LOGI(TAG, "自环[下行]: 发送 %d 字节 (1 秒 440Hz), HTTP %d (headers=%lld)",
+                 sent, status, (long long)hdr2);
+
+        /* 读响应体 (设备会回报播了多少帧) */
+        char resp[128] = {0};
+        int rlen = esp_http_client_read(cli, resp, sizeof(resp) - 1);
+        if (rlen > 0) {
+            resp[rlen] = '\0';
+            ESP_LOGI(TAG, "自环[下行]: 设备响应: %s", resp);
+        }
+        esp_http_client_close(cli);
+        esp_http_client_cleanup(cli);
+        free(pcm);
+
+        if (sent == frames * (int)sizeof(int16_t) && status == 200) {
+            ESP_LOGI(TAG, "自环[下行] 通过 —— 1 秒音频已送入设备播放");
+        } else {
+            ESP_LOGE(TAG, "自环[下行] 失败: 发了 %d 字节, HTTP %d", sent, status);
+        }
+    }
+
+    ESP_LOGI(TAG, "自环测试结束");
+#endif
+}
+
 /* ---------------- 串口调试命令 ---------------- */
 
 /*
  * 排障用的调试命令 (通过 USB 串口输入, 换行执行):
  *
- *   lcd0  显示摄像头画面 (默认)
- *   lcd1  显示固定测试图样 (不碰摄像头)  -> 判定 LCD/SPI 链路好坏
- *   lcd2  显示合成渐变图 (走 draw_rgb565 路径) -> 判定画图代码路径好坏
- *   stat  打印性能与撕裂统计
+ *   lcd0    显示摄像头画面 (默认)
+ *   lcd1    显示固定测试图样 (不碰摄像头)  -> 判定 LCD/SPI 链路好坏
+ *   lcd2    显示合成渐变图 (走 draw_rgb565 路径) -> 判定画图代码路径好坏
+ *   stat    打印性能与撕裂统计
+ *   q       打印【花屏量化指标】(g2_bad 最重要: 干净 <1%, 花屏 11~20%)
+ *   hash    缓冲稳定性测试 (同一帧隔 250ms 算两次哈希)
+ *   conv 0/1 关/开硬件 YUV->RGB 转换器 (A/B 对照, 会安全暂停生产者)
+ *   mode 0/1/2/3 传感器模式: 0=YUV422+转换器 1=直出RGB565 2=灰度 3=直出YUV422(真值)
+ *   gfix    开关【软件修复绿色低位】(转换器绿色低位是随机噪声, 修它最直接)
+ *   gfixstat 打印 gfix 状态
+ *   cbar 0/1 关/开传感器内置彩条 (黄金标准测试: 判定根因在链路还是数据解释)
+ *   pclk 0/1/2/3 设 GC0308 的 PCLK 分频 (0x28): DVP 采样太快要降速
+ *   spiclk N 设 LCD 的 SPI 时钟 (Hz), 用来定位"时钟太快导致花屏"
+ *   pda 0/1 关/开 PSRAM DMA 直写 (A/B 对照: 哪个模式不花屏)
+ *   wifioff 关掉 Wi-Fi (用来验证: 花屏是不是 PSRAM 总线争用引起的)
+ *   wifix   重新打开 Wi-Fi
+ *   astat   打印音频统计 (peak/rms/累计样本)
+ *   tone    开关循环测试音 (toggle)
+ *   vol N   设置输出音量 0-100
+ *   gain N  设置麦克风输入增益 -40 ~ +40 dB
+ *   astop   停掉所有音频后台任务
  *
  * 为什么用运行时命令而不是编译期宏:
  *   花屏排查需要反复切换对照, 每次改宏都要重新编译烧录 (约 2 分钟),
  *   改命令则只要敲一行, 当场就能看到结果。
+ *
+ * ---------------------------------------------------------------------------
+ * 为什么不用 read(STDIN_FILENO) 而用 usb_serial_jtag_read_bytes()
+ *
+ * 之前这里用 read(STDIN_FILENO, &ch, 1) 读命令, 结果命令永远收不到。
+ * 原因:
+ *   CONFIG_ESP_CONSOLE_UART_DEFAULT=y  ->  IDF 的主 console 挂在 UART0
+ *                                          (排针 GPIO43/44), stdout 也走它
+ *   CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y -> USB-Serial-JTAG 只是
+ *                                          "次要" console, 只转发输出, 不接输入
+ *
+ *   而我们的 COM3 正是 USB-Serial/JTAG 设备。于是:
+ *     - 往 COM3 发的字节进的是 USB-Serial-JTAG 的 RX 缓冲
+ *     - read(STDIN_FILENO) 读的是 UART0 (排针), 根本不是同一个地方
+ *     - 而且就算读对了, 还会和 IDF console 抢 stdin, 行为不可预测
+ *
+ * 正确做法: 直接用 usb_serial_jtag_read_bytes() 从 USB 设备读, 和 IDF
+ * console 的输出互不干扰 (console 的 stdout 走 UART0, 我们只读 USB RX)。
+ * 输出仍然用 ESP_LOGI (走 IDF 的双路 console, COM3 上也能看到)。
  */
 static void uart_cmd_task(void *arg)
 {
@@ -1173,10 +3939,9 @@ static void uart_cmd_task(void *arg)
 
     while (true) {
         uint8_t ch;
-        int n = read(STDIN_FILENO, &ch, 1);
+        int n = usb_serial_jtag_read_bytes(&ch, 1, pdMS_TO_TICKS(50));
         if (n != 1) {
-            vTaskDelay(pdMS_TO_TICKS(20));
-            continue;
+            continue;   /* 超时, 回去再读 */
         }
         if (ch == '\r' || ch == '\n') {
             if (len > 0) {
@@ -1190,13 +3955,404 @@ static void uart_cmd_task(void *arg)
                 } else if (strcmp(line, "lcd2") == 0) {
                     s_lcd_mode = LCD_MODE_SYNTH;
                     ESP_LOGI(TAG, "LCD 模式: 合成渐变图");
+                } else if (strcmp(line, "ldirect") == 0) {
+                    /* A/B 对照开关: 直绘 vs 拷贝到槽位再画 */
+                    s_lcd_direct_draw = !s_lcd_direct_draw;
+                    ESP_LOGI(TAG, "LCD 显示路径: %s",
+                             s_lcd_direct_draw
+                             ? "直绘 (不拷贝)"
+                             : "旧路径 (拷贝到 PSRAM 槽位)");
+                } else if (strcmp(line, "noise") == 0) {
+                    /* 噪点统计开关 (会读 PSRAM, 排障用) */
+                    s_noise_enabled = !s_noise_enabled;
+                    ESP_LOGI(TAG, "噪点统计: %s", s_noise_enabled ? "开" : "关");
                 } else if (strcmp(line, "stat") == 0) {
                     ESP_LOGI(TAG, "cam_frames=%u jpg_frames=%u jpg_bytes=%u torn=%u clean=%u",
                              (unsigned)s_cam_frames, (unsigned)s_jpg_frames,
                              (unsigned)s_jpg_bytes,
                              (unsigned)s_torn_frames, (unsigned)s_clean_frames);
+                } else if (strcmp(line, "cfg") == 0) {
+                    camera_print_config();
+                } else if (strncmp(line, "bstab ", 6) == 0) {
+                    /* bstab 0/1  开关亮度稳定器; bstab 单独则打印状态 */
+                    if (strlen(line) > 6) {
+                        s_bright_stab = (atoi(line + 6) != 0);
+                        ESP_LOGI(TAG, "亮度稳定器: %s", s_bright_stab ? "开" : "关");
+                    } else {
+                        ESP_LOGI(TAG, "亮度稳定器: %s  参考亮度=%.0f  已调整 %u 帧  "
+                                      "最近缩放=%u%%",
+                                 s_bright_stab ? "开" : "关",
+                                 (double)s_bright_ref,
+                                 (unsigned)s_bright_adjust_count,
+                                 (unsigned)s_bright_last_scale_pct);
+                    }
+                } else if (strncmp(line, "bref ", 5) == 0) {
+                    int v = atoi(line + 5);
+                    if (v < 1000 || v > 60000) {
+                        ESP_LOGE(TAG, "用法: bref <1000..60000>");
+                    } else {
+                        s_bright_ref = (float)v;
+                        ESP_LOGI(TAG, "参考亮度设为 %d", v);
+                    }
+                } else if (strncmp(line, "wr ", 3) == 0) {
+                    /* wr <reg> <val>  写 page0 的任意寄存器 (调试用) */
+                    unsigned r = 0, v = 0;
+                    if (sscanf(line + 3, "%x %x", &r, &v) != 2 || r > 0xff || v > 0xff) {
+                        ESP_LOGE(TAG, "用法: wr <reg> <val>   (都是十六进制, 如 wr 22 52)");
+                    } else {
+                        uint8_t page = 0xfe;
+                        uint8_t buf[2] = { (uint8_t)r, (uint8_t)v };
+                        if (i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                                       &page, 1, 100 / portTICK_PERIOD_MS) == ESP_OK &&
+                            i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                                       buf, 2, 100 / portTICK_PERIOD_MS) == ESP_OK) {
+                            uint8_t rb = 0;
+                            i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                                       (uint8_t[]){(uint8_t)r}, 1,
+                                                       100 / portTICK_PERIOD_MS);
+                            i2c_master_read_from_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                                        &rb, 1, 100 / portTICK_PERIOD_MS);
+                            ESP_LOGI(TAG, "写 0x%02x = 0x%02x, 回读 0x%02x", r, v, rb);
+                        } else {
+                            ESP_LOGE(TAG, "写 0x%02x 失败", r);
+                        }
+                    }
+                } else if (strncmp(line, "aelock ", 7) == 0) {
+                    camera_set_ae_lock(atoi(line + 7) != 0);
+                } else if (strncmp(line, "expo ", 5) == 0) {
+                    int t = 0, g = -1;
+                    int n = sscanf(line + 5, "%d %d", &t, &g);
+                    if (n < 1) {
+                        ESP_LOGE(TAG, "用法: expo <time> [gain]  (time 0..4095, gain 0..63)");
+                    } else {
+                        if (g < 0) g = 0x14;   /* 默认全局增益 20 */
+                        camera_set_manual_exposure(t, g);
+                    }
+                } else if (strncmp(line, "cgain ", 6) == 0) {
+                    int g = atoi(line + 6);
+                    if (g < 0 || g > 63) {
+                        ESP_LOGE(TAG, "用法: cgain <0..63>");
+                    } else {
+                        uint8_t page = 0xfe;
+                        uint8_t buf[2] = {0x50, (uint8_t)g};
+                        if (i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                                       &page, 1, 100 / portTICK_PERIOD_MS) == ESP_OK) {
+                            i2c_master_write_to_device(BOARD_I2C_PORT, CAM_SCCB_ADDR,
+                                                       buf, 2, 100 / portTICK_PERIOD_MS);
+                            ESP_LOGI(TAG, "摄像头全局增益设为 %d (0x%02x)", g, g);
+                        }
+                    }
+                } else if (strncmp(line, "gain ", 5) == 0) {
+                    /*
+                     * 【命令名冲突 —— 之前踩过的坑】
+                     *
+                     * 摄像头的全局增益叫 "gain <0..63>", 麦克风增益也叫
+                     * "gain <dB>", 两者撞名。摄像头分支在前, 音频分支永远
+                     * 执行不到, 结果 "gain 30" 改的是摄像头, 麦克风增益
+                     * 还是默认的 12dB —— 查电平不涨就是踩了这个坑。
+                     *
+                     * 现在拆开: 摄像头用 cgain, 麦克风用 mgain。
+                     * "gain" 保留但只提示, 避免再误用。
+                     */
+                    ESP_LOGW(TAG, "命令名有歧义, 请用:");
+                    ESP_LOGW(TAG, "  cgain <0..63>  摄像头全局增益");
+                    ESP_LOGW(TAG, "  mgain <-40..40>  麦克风增益 (dB)");
+                } else if (strncmp(line, "regs", 4) == 0) {
+                    /* regs <st> <en>            -> page0
+                     * regs <page> <st> <en>     -> 指定页
+                     * (都支持 0x 十六进制) */
+                    unsigned pg = 0, st = 0x00, en = 0x5f;
+                    int n = sscanf(line + 4, "%x %x %x", &pg, &st, &en);
+                    if (n == 3) {
+                        if (pg > 0xff) pg = 0;
+                        if (st > 0xff) st = 0xff;
+                        if (en > 0xff) en = 0xff;
+                        if (en < st) en = st;
+                        camera_dump_regs_page((int)pg, (int)st, (int)en);
+                    } else if (n == 2) {
+                        if (st > 0xff) st = 0xff;
+                        if (en > 0xff) en = 0xff;
+                        if (en < st) en = st;
+                        camera_dump_regs_range((int)st, (int)en);
+                    } else {
+                        camera_dump_regs_range(0x00, 0x5f);
+                    }
+                } else if (strcmp(line, "q") == 0) {
+                    /*
+                     * 花屏量化指标。
+                     *
+                     * 【最重要】g2_bad: 绿色低 3 位的坏点占比。
+                     *   干净画面 < 1%; 花屏状态 11~20%。
+                     *   这是逐通道算的真指标 (旧的 hi/lo_energy 有位域边界伪像)。
+                     *
+                     * 旧的 hi/lo_energy 只作参考: 它的低字节能量天然偏大
+                     * (跨位域边界会有 32 的台阶), 不能当作噪声判据。
+                     */
+                    ESP_LOGI(TAG, "QUAL: g2_bad=%u.%02u%% g2_energy=%u.%02u r5_energy=%u.%02u b5_energy=%u.%02u",
+                             (unsigned)(s_g2_bad_pct / 100), (unsigned)(s_g2_bad_pct % 100),
+                             (unsigned)(s_g2_energy / 100), (unsigned)(s_g2_energy % 100),
+                             (unsigned)(s_r5_energy / 100), (unsigned)(s_r5_energy % 100),
+                             (unsigned)(s_b5_energy / 100), (unsigned)(s_b5_energy % 100));
+                    ESP_LOGI(TAG, "      (旧指标,仅供参考) hi_energy=%u.%02u lo_energy=%u.%02u bad_rows=%u/%u frames=%u",
+                             (unsigned)(s_hi_energy / 100), (unsigned)(s_hi_energy % 100),
+                             (unsigned)(s_lo_energy / 100), (unsigned)(s_lo_energy % 100),
+                             (unsigned)s_bad_rows, (unsigned)NOISE_PROBE_ROWS,
+                             (unsigned)s_qual_frames);
+                } else if (strcmp(line, "hash") == 0) {
+                    /* 触发缓冲稳定性测试 (会阻塞 250ms, 帧率临时掉到 4fps) */
+                    s_hash_test_armed = true;
+                    ESP_LOGI(TAG, "缓冲稳定性测试已触发, 稍等结果...");
+                } else if (strncmp(line, "conv ", 5) == 0) {
+                    /*
+                     * A/B 切换硬件转换器。
+                     *   conv 1 = YUV422 + 硬件转换器
+                     *   conv 0 = GC0308 直接输出 RGB565 (不走转换器)
+                     *
+                     * 【重要】之前这个命令会直接 esp_camera_deinit(),
+                     * 而生产者任务正在 esp_camera_fb_get() 里 —— 两者并发,
+                     * 立刻 RTC_SW_CPU_RST 复位, 板子重启, 转换器又变回"开",
+                     * 所以这个 A/B 从来没真正测成功过。
+                     *
+                     * 现在: 先让生产者安全退出 (它会在【没握帧】的时候退出),
+                     * 再做 deinit/init。
+                     */
+                    int on = atoi(line + 5);
+                    bool want = (on != 0);
+                    if (want == s_use_converter) {
+                        ESP_LOGI(TAG, "转换器已经是 %s", want ? "开" : "关");
+                    } else {
+                        ESP_LOGI(TAG, "切换转换器: %s -> %s (安全暂停生产者)",
+                                 s_use_converter ? "开" : "关", want ? "开" : "关");
+                        /* 1) 请求生产者暂停 */
+                        s_cam_pause = true;
+                        /* 2) 等它确认已退出 (最多 2 秒) */
+                        int waited = 0;
+                        while (!s_cam_paused && waited < 200) {
+                            vTaskDelay(pdMS_TO_TICKS(10));
+                            waited++;
+                        }
+                        if (!s_cam_paused) {
+                            ESP_LOGE(TAG, "生产者没能安全暂停, 放弃切换 (不冒险复位)");
+                            s_cam_pause = false;
+                        } else {
+                            s_use_converter = want;
+                            esp_camera_deinit();
+                            camera_init();
+                            s_cam_pause = false;
+                            ESP_LOGI(TAG, "切换完成, 现在发 q 看 g2_bad "
+                                     "(干净 <1%%, 花屏 11~20%%)");
+                        }
+                    }
+                } else if (strncmp(line, "mode ", 5) == 0) {
+                    /*
+                     * 切换传感器输出模式 (决定性 A/B 实验):
+                     *   mode 0 = YUV422 + 硬件转换器 -> RGB565 (当前默认)
+                     *   mode 1 = 传感器直出 RGB565 (不走转换器)
+                     *   mode 2 = GRAYSCALE (1 字节/像素, 不打包不转换)
+                     *
+                     * mode 2 是最干净的探针: 如果灰度完全干净, 说明 DVP 链路
+                     * 本身没问题, 毛病在 "16 位打包 + 转换器" 这一环。
+                     */
+                    int m = atoi(line + 5);
+                    if (m < 0 || m > 3) {
+                        ESP_LOGI(TAG, "mode 必须是 0/1/2/3");
+                    } else if (m == s_sensor_mode) {
+                        ESP_LOGI(TAG, "已经是模式 %d", m);
+                    } else {
+                        ESP_LOGI(TAG, "切换传感器模式 %d -> %d", s_sensor_mode, m);
+                        s_cam_pause = true;
+                        int waited = 0;
+                        while (!s_cam_paused && waited < 200) {
+                            vTaskDelay(pdMS_TO_TICKS(10));
+                            waited++;
+                        }
+                        if (!s_cam_paused) {
+                            ESP_LOGE(TAG, "生产者没能安全暂停, 放弃切换");
+                            s_cam_pause = false;
+                        } else {
+                            s_sensor_mode = m;
+                            esp_camera_deinit();
+                            camera_init();
+                            s_cam_pause = false;
+                            ESP_LOGI(TAG, "切换完成");
+                        }
+                    }
+                } else if (strcmp(line, "rawdump") == 0) {
+                    /*
+                     * 通过串口导出一帧原始 RGB565 (取证用)。
+                     *
+                     * 好处: 不依赖 Wi-Fi/HTTP, 在任何时候都能把原始字节流
+                     * 拿回电脑逐位分析。格式:
+                     *   RAWDUMP <seq> <len>\r\n<len 字节二进制>\r\nDONE\r\n
+                     */
+                    s_raw_dump_requested = true;
+                    ESP_LOGI(TAG, "已请求原始帧导出, 等待下一帧...");
+                } else if (strcmp(line, "gfix") == 0) {
+                    /*
+                     * 软件修复绿色低位 (toggle)。
+                     *
+                     * 硬件转换器的绿色低 3 位是随机噪声 (实测自相关 0.39,
+                     * 熵 3.00 bit), 而绿色高 3 位是干净的 (自相关 0.95)。
+                     * 所以可以用邻居中值把低 3 位填回去:
+                     *   修复前 G2 自相关 0.39 -> 修复后 0.92。
+                     *
+                     * 开启后: 屏幕上绿色闪烁消失, g2_bad 应该掉到 1% 以下。
+                     */
+                    s_green_fix = !s_green_fix;
+                    ESP_LOGI(TAG, "软件修复绿色低位: %s", s_green_fix ? "开" : "关");
+                    if (s_green_fix) {
+                        ESP_LOGI(TAG, "  (下一帧生效, 稍等 1 秒再发 q 看 g2_bad)");
+                    }
+                } else if (strncmp(line, "cbar", 4) == 0) {
+                    /*
+                     * 传感器彩条 A/B —— 判定根因在"采集链路"还是"数据解释"。
+                     *
+                     *   cbar 1 = 打开彩条 (固定图案, 不经过镜头)
+                     *   cbar 0 = 关掉彩条, 恢复正常画面
+                     *
+                     * 用法: cbar 1 -> 等 2 秒 -> 抓一帧原始数据到电脑看。
+                     *       彩条干净 = 链路好, 继续查数据解释;
+                     *       彩条也花 = 链路坏, 查 DVP/时钟/DMA。
+                     */
+                    int on = atoi(line + 5);
+                    camera_set_colorbar(on != 0);
+                } else if (strncmp(line, "pclk ", 5) == 0) {
+                    /*
+                     * 运行时调节 PCLK 分频 (GC0308 寄存器 0x28 bit[6:4])。
+                     *
+                     *   pclk 0 = 不分频 (PCLK ~48MHz, 不可靠)
+                     *   pclk 1 = 2 分频 (PCLK ~24MHz)
+                     *   pclk 2 = 4 分频 (PCLK ~12MHz)  <- 【当前默认, 最干净】
+                     *   pclk 3 = 8 分频 (PCLK ~6MHz,  太慢)
+                     *
+                     * 分频越大 PCLK 越慢, DVP 采样越可靠, 但帧率也越低。
+                     * 客观评估方法: cbar 1 开彩条 -> rawdump 连抓两帧 ->
+                     * 逐位对比, bit 翻转率越低越干净。
+                     */
+                    camera_set_pclk_div(atoi(line + 5));
+                } else if (strncmp(line, "spiclk ", 7) == 0) {
+                    /*
+                     * 运行时调 LCD 的 SPI 时钟 (A/B 对照)。
+                     *
+                     *   spiclk 60000000 / 40000000 / 20000000 / 10000000
+                     *
+                     * 背景: 实测证明【摄像头数据是干净的】(浏览器里的 MJPEG
+                     * 画面完全没有噪点, JPEG 编码器和 LCD 读的是同一个
+                     * fb->buf), 所以花屏只发生在 LCD 的 SPI 发送路径。
+                     * 现在双缓冲 + ISR 安全信号量已经修掉了 buf 复用竞争,
+                     * 如果还花, 下一个嫌疑就是 SPI 时钟太快导致采样出错。
+                     */
+                    int hz = atoi(line + 7);
+                    if (hz < 1000000 || hz > 80000000) {
+                        ESP_LOGE(TAG, "频率要在 1MHz~80MHz 之间");
+                    } else {
+                        lcd_set_spi_clock(hz);
+                    }
+                } else if (strcmp(line, "gfixstat") == 0) {
+                    ESP_LOGI(TAG, "GFIX: %s", s_green_fix ? "开" : "关");
+                } else if (strcmp(line, "wifioff") == 0) {
+                    /*
+                     * 关掉 Wi-Fi —— 决定性对照实验。
+                     *
+                     * 假设: 花屏是 DVP 往 PSRAM 写数据时和 Wi-Fi 抢总线导致的
+                     *       (esp32-camera README: "image data might be missing.
+                     *        This is particularly true if WiFi is enabled.")
+                     * 验证: 关掉 Wi-Fi 后再发 "q", 如果 bad_rows 掉到 0, 假设成立。
+                     */
+                    esp_wifi_stop();
+                    ESP_LOGI(TAG, "Wi-Fi 已停止 (现在发 q 看 bad_rows 是否归零)");
+                } else if (strncmp(line, "pda ", 4) == 0) {
+                    /*
+                     * A/B 切换 PSRAM DMA 直写模式。
+                     *
+                     *   pda 1 = DVP 直写 PSRAM (快, 但会丢 bit -> 花屏)
+                     *   pda 0 = DVP 落内部 RAM, CPU 再拷 (慢一点, 但数据可靠)
+                     *
+                     * 切换会重建整套摄像头 DMA, 需要一两秒。
+                     * 切换完发 "q" 看 bad_rows, 用数字决定哪个好。
+                     */
+                    int on = atoi(line + 4);
+                    bool want = (on != 0);
+                    if (want == s_psram_dma_mode) {
+                        ESP_LOGI(TAG, "PSRAM DMA 模式已经是 %s", want ? "开" : "关");
+                    } else {
+                        ESP_LOGI(TAG, "切换 PSRAM DMA 模式: %s -> %s",
+                                 s_psram_dma_mode ? "开" : "关", want ? "开" : "关");
+                        /* 和 conv 一样, 必须先安全暂停生产者 */
+                        s_cam_pause = true;
+                        int waited = 0;
+                        while (!s_cam_paused && waited < 200) {
+                            vTaskDelay(pdMS_TO_TICKS(10));
+                            waited++;
+                        }
+                        if (!s_cam_paused) {
+                            ESP_LOGE(TAG, "生产者没能安全暂停, 放弃切换");
+                            s_cam_pause = false;
+                        } else {
+                            esp_err_t perr = esp_camera_set_psram_mode(want);
+                            if (perr != ESP_OK) {
+                                ESP_LOGE(TAG, "切换失败: %s", esp_err_to_name(perr));
+                            } else {
+                                s_psram_dma_mode = want;
+                                ESP_LOGI(TAG, "切换完成, 现在发 q 看 g2_bad");
+                            }
+                            s_cam_pause = false;
+                        }
+                    }
+                } else if (strcmp(line, "wifix") == 0) {
+                    esp_wifi_start();
+                    ESP_LOGI(TAG, "Wi-Fi 已重启");
+                } else if (strcmp(line, "tone") == 0) {
+                    /* toggle: 已经在跑就停, 没在跑就开 */
+                    audio_board_stats_t as;
+                    audio_board_get_stats(&as);
+                    if (as.tone_playing) {
+                        audio_board_stop_tone();
+                        ESP_LOGI(TAG, "测试音已停止");
+                    } else if (audio_board_start_tone() == ESP_OK) {
+                        ESP_LOGI(TAG, "测试音已启动 (3 秒一轮, 再发 tone 停止)");
+                    } else {
+                        ESP_LOGE(TAG, "测试音启动失败");
+                    }
+                } else if (strcmp(line, "axtest") == 0) {
+                    audio_selftest_loop();
+                } else if (strcmp(line, "scan") == 0) {
+                    wifi_scan_and_report();
+                } else if (strcmp(line, "astat") == 0) {
+                    audio_board_stats_t as;
+                    if (audio_board_get_stats(&as) == 0) {
+                        ESP_LOGI(TAG, "AUDIO peak=%u rms=%u L(p=%u r=%u) samples=%u frames=%u speaking=%d tone=%d",
+                                 (unsigned)as.peak, (unsigned)as.rms,
+                                 (unsigned)as.peak_l, (unsigned)as.peak_r,
+                                 (unsigned)as.samples, (unsigned)as.frames,
+                                 (int)as.speaking, (int)as.tone_playing);
+                    }
+                } else if (strcmp(line, "astop") == 0) {
+                    audio_board_stop_background();
+                    ESP_LOGI(TAG, "音频后台任务已停止");
+                } else if (strncmp(line, "vol ", 4) == 0) {
+                    int v = atoi(line + 4);
+                    if (v < 0) v = 0;
+                    if (v > 100) v = 100;
+                    if (audio_board_set_output_volume(v) == 0) {
+                        ESP_LOGI(TAG, "输出音量 = %d", v);
+                    } else {
+                        ESP_LOGE(TAG, "设置音量失败");
+                    }
+                } else if (strncmp(line, "mgain ", 6) == 0) {
+                    float g = (float)atof(line + 6);
+                    if (g < -40.0f) g = -40.0f;
+                    if (g > 40.0f)  g = 40.0f;
+                    if (audio_board_set_input_gain(g) == 0) {
+                        ESP_LOGI(TAG, "麦克风增益 = %.1f dB", g);
+                    } else {
+                        ESP_LOGE(TAG, "设置增益失败");
+                    }
+                } else if (strcmp(line, "adcreg") == 0) {
+                    audio_board_dump_adc_regs();
                 } else {
-                    ESP_LOGW(TAG, "未知命令: %s (可用: lcd0/lcd1/lcd2/stat)", line);
+                    ESP_LOGW(TAG, "未知命令: %s", line);
+                    ESP_LOGW(TAG, "可用: lcd0/lcd1/lcd2/stat/q/hash/conv 0|1/pda 0|1/wifioff/wifix/astat/adcreg/tone/astop/vol N/mgain N/cgain N/scan/axtest");
                 }
                 len = 0;
             }
@@ -1220,23 +4376,31 @@ static void uart_cmd_task(void *arg)
  * 每 50ms 轮询一次, 如果每次都做「读 CONFIG + 写 CONFIG」的读改写,
  * 会和摄像头的 SCCB 抢同一条 I2C 总线 (SDA=3/SCL=2), 反而更容易掉帧。
  */
-static bool aw_key_pressed(void)
+/* 读单个 AW 键的状态, 返回 true = 按下 (低有效) */
+static bool aw_key_state(uint8_t pin)
 {
     bool high = true;
-
-    if (aw9523b_get_level(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_KEY_K1, &high) == ESP_OK) {
-        if (!high) {
-            return true;
-        }
-    }
-    if (aw9523b_get_level(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_KEY_K2, &high) == ESP_OK) {
-        if (!high) {
-            return true;
-        }
+    if (aw9523b_get_level(BOARD_I2C_PORT, AW9523B_I2C_ADDR, pin, &high) == ESP_OK) {
+        return !high;
     }
     return false;
 }
 
+/*
+ * 按键任务。
+ *
+ * 三个键各有分工:
+ *   BOOT (GPIO0)  -> 触发看护事件 (网页弹提示)
+ *   K1  (XIO0)    -> 音量 -
+ *   K2  (XIO1)    -> 音量 +
+ *
+ * 音量调节是老人自己最需要的操作 —— 老人耳朵不好, 音量必须能自己调,
+ * 不能每次都找子女帮忙改固件。
+ *
+ * 注意: K1/K2 的方向 (输入) 已在 camera_power_reset() 里设好, 这里不再重复写。
+ * 每 50ms 轮询一次, 如果每次都做「读 CONFIG + 写 CONFIG」的读改写,
+ * 会和摄像头的 SCCB 抢同一条 I2C 总线 (SDA=3/SCL=2), 反而更容易掉帧。
+ */
 static void button_task(void *arg)
 {
     uint32_t last_event_ms = 0;
@@ -1249,27 +4413,57 @@ static void button_task(void *arg)
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&cfg);
-    ESP_LOGI(TAG, "按键已配置 (BOOT=GPIO%d, K1/K2=AW9523B XIO%d/XIO%d)",
+    ESP_LOGI(TAG, "按键已配置 (BOOT=GPIO%d=事件, K1(XIO%d)=音量-, K2(XIO%d)=音量+)",
              BTN_BOOT_GPIO, XIO_KEY_K1, XIO_KEY_K2);
 
     while (true) {
         bool boot_down = (gpio_get_level(BTN_BOOT_GPIO) == 0);
-        bool key_down  = aw_key_pressed();
+        bool k1_down    = aw_key_state(XIO_KEY_K1);
+        bool k2_down    = aw_key_state(XIO_KEY_K2);
 
-        if (boot_down || key_down) {
+        if (boot_down || k1_down || k2_down) {
             vTaskDelay(pdMS_TO_TICKS(30));
 
-            /* 等到松开 */
-            while (gpio_get_level(BTN_BOOT_GPIO) == 0 || aw_key_pressed()) {
+            /* 等到松开 (三个键都松开才算一次操作结束) */
+            while (gpio_get_level(BTN_BOOT_GPIO) == 0 ||
+                   aw_key_state(XIO_KEY_K1) ||
+                   aw_key_state(XIO_KEY_K2)) {
                 vTaskDelay(pdMS_TO_TICKS(20));
             }
 
             uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-            if (now - last_event_ms < 1000) {
+            if (now - last_event_ms < 300) {
                 continue;
             }
             last_event_ms = now;
 
+            /* ---- 音量调节 (优先级高于事件) ---- */
+            if (k1_down || k2_down) {
+                int step = (k1_down && k2_down) ? 0 : (k1_down ? -10 : +10);
+                if (step == 0) {
+                    /* 两个键同时按 = 静音/取消静音 */
+                    int v = audio_board_get_output_volume();
+                    if (v <= 0) {
+                        audio_board_set_output_volume(60);
+                        ESP_LOGI(TAG, "取消静音, 音量 = 60");
+                    } else {
+                        audio_board_set_output_volume(0);
+                        ESP_LOGI(TAG, "静音");
+                    }
+                } else {
+                    int v = audio_board_get_output_volume();
+                    if (v < 0) v = 60;      /* 音频没起来, 从默认值起步 */
+                    v += step;
+                    if (v < 0) v = 0;
+                    if (v > 100) v = 100;
+                    if (audio_board_set_output_volume(v) == 0) {
+                        ESP_LOGI(TAG, "输出音量 = %d", v);
+                    }
+                }
+                continue;   /* 音量操作不产生看护事件 */
+            }
+
+            /* ---- 看护事件 ---- */
             button_event_t ev;
             memset(&ev, 0, sizeof(ev));
             ev.has_event = true;
@@ -1310,8 +4504,17 @@ void app_main(void)
              (unsigned int)esp_psram_get_size(),
              (unsigned int)esp_get_free_heap_size());
 
+    /* G.711 自检 —— 语音编码的量化逻辑写错了不会崩溃, 只会"听起来不对",
+     * 所以开机先拿 ITU-T 官方参考向量验一遍。 */
+    g711_selftest();
+
     board_i2c_init();
     camera_power_reset();
+
+#if AUDIO_I2C_SCAN_ENABLE
+    /* 音频 codec 探测 (只在需要排查硬件时打开) */
+    i2c_scan_audio();
+#endif
 
     /* 屏幕: 背光已在 AW9523B 里打开, 这里初始化面板驱动 */
     bool lcd_ok = (lcd_init() == ESP_OK);
@@ -1351,12 +4554,61 @@ void app_main(void)
         ESP_LOGI(TAG, "诊断缓冲就绪: %dx%d 内部RAM", DIAG_W, DIAG_H);
     }
 
+    /* 原始帧快照 (取证用, 走 /raw 端点导出) */
+    s_raw_snapshot = heap_caps_malloc(RAW_SNAPSHOT_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_raw_snapshot == NULL) {
+        ESP_LOGE(TAG, "原始帧快照缓冲分配失败");
+    } else {
+        ESP_LOGI(TAG, "原始帧快照缓冲就绪 (%" PRIu32 " 字节)", (uint32_t)RAW_SNAPSHOT_BYTES);
+    }
+
     ESP_LOGI(TAG, "帧槽位就绪: %d 个 RGB565(%u字节) + %d 个 JPEG(%u字节)",
              SLOT_COUNT, (unsigned)RGB565_SLOT_BYTES,
              SLOT_COUNT, (unsigned)JPEG_SLOT_BYTES);
 
     camera_init();
 #endif
+
+    /*
+     * 音频: ES8311 (播放 DAC) + ES7210 (麦克风 ADC)。
+     * 放在摄像头之后 —— 摄像头初始化要抢 SPI/GDMA, 先让它拿到资源。
+     */
+    if (audio_board_init() == ESP_OK) {
+        ESP_LOGI(TAG, "音频子系统就绪");
+        /*
+         * 开机自检: 播放 100ms 测试音 + 录 800ms 统计电平。
+         * 这是启动健康检查 —— 如果 codec 没起来, 这里会打警告。
+         * 波形缓冲放堆上 —— app_main 的栈只有 8192 字节, 放不下 1600 帧。
+         */
+        int16_t *wave = heap_caps_malloc(512 * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        int peak = audio_board_selftest(800, wave, 512);
+        ESP_LOGI(TAG, "音频自检完成, 录音峰值=%d", peak);
+        if (wave) free(wave);
+
+        /*
+         * 起录音监测任务: 每秒打一条电平。对着麦克风说话时 rms 应该明显
+         * 抬高 (日志里会显示 [有声音])。这是验证麦克风是否真的接通的
+         * 最直接办法 —— 比"读到了非零数据"更有说服力。
+         */
+        if (audio_board_start_monitor() == ESP_OK) {
+            ESP_LOGI(TAG, "录音监测已启动, 对着麦克风说话看 rms 变化");
+        }
+
+#if AUDIO_SELFTONE
+        /*
+         * 开机自动循环播测试音。
+         *
+         * 目的: 验证喇叭链路 (ES8311 DAC -> 功放 -> 喇叭) 真的通。
+         * I2S 写入成功只能证明软件侧没问题, 功放没使能/喇叭虚焊这类
+         * 硬件问题只能靠耳朵听出来。调试完记得改回 0。
+         */
+        if (audio_board_start_tone() == ESP_OK) {
+            ESP_LOGI(TAG, "测试音已自动启动 (每 3 秒响 1 秒), 请听喇叭");
+        }
+#endif
+    } else {
+        ESP_LOGW(TAG, "音频初始化失败，视频功能不受影响");
+    }
 
 #if LCD_SELFTEST_ONLY
     /*
@@ -1449,7 +4701,7 @@ void app_main(void)
             }
 
             /* 绘制到屏幕 —— 这一步会花掉几十毫秒 */
-            lcd_draw_rgb565(fb->buf, fb->width * 2, 0, 0, fb->width, fb->height, true);
+            lcd_draw_rgb565(fb->buf, fb->width * 2, 0, 0, fb->width, fb->height, true, true);
 
             /* 绘制【后】再算一次 */
             {
@@ -1500,17 +4752,13 @@ void app_main(void)
      *
      * 0 = 完全不开 WiFi (纯本地显示, 最干净的对照组)
      * 1 = 正常开 WiFi
+     *
+     * 注意: 这个宏定义必须在文件靠前的位置 (这里), 因为上面的
+     * audio_selftest_loop() 里也用 #if WIFI_ENABLE 做编译期分支。
+     * 之前它定义在文件末尾, 那里前面的代码看到的 WIFI_ENABLE 是 0,
+     * 导致自环测试直接被编译掉了。
      */
-#ifndef WIFI_ENABLE
-#define WIFI_ENABLE 0
-#endif
-
-#if WIFI_ENABLE
     wifi_init();
-#else
-    ESP_LOGW(TAG, "WiFi DISABLED by WIFI_ENABLE=0 (diagnostic mode)");
-#endif
-
 #if WIFI_ENABLE
 #if WIFI_MODE_AP
     /* AP 模式: 热点起来就能用, IP 固定 192.168.4.1 */
@@ -1541,6 +4789,30 @@ void app_main(void)
     http_server_start();
 #endif
 
+    /*
+     * USB-Serial-JTAG 驱动。
+     *
+     * 串口调试命令要直接从 USB 设备读字节, 但这个驱动默认没装
+     * (IDF 只把它当"次要 console"用来转发输出, 不装驱动就没法读)。
+     * 装上之后 usb_serial_jtag_read_bytes() 就能拿到 COM3 发来的字节。
+     *
+     * 注意: 装了驱动以后, ESP_LOGI 的输出依然走 IDF 的双路 console,
+     * COM3 上照常能看到日志, 两者不冲突 (一个只读 USB RX, 一个只写)。
+     */
+    if (!usb_serial_jtag_is_driver_installed()) {
+        usb_serial_jtag_driver_config_t usb_cfg = {
+            .rx_buffer_size = 1024,
+            .tx_buffer_size = 1024,
+        };
+        esp_err_t uerr = usb_serial_jtag_driver_install(&usb_cfg);
+        if (uerr != ESP_OK) {
+            ESP_LOGW(TAG, "USB-Serial-JTAG 驱动安装失败 (%s), 串口命令不可用",
+                     esp_err_to_name(uerr));
+        } else {
+            ESP_LOGI(TAG, "USB-Serial-JTAG 驱动已就绪, 串口命令可用");
+        }
+    }
+
     task_start(button_task, "button_task", 4096, 5);
     task_start(aw9523b_diag_task, "aw_diag", 4096, 4);
 #if WIFI_ENABLE && !WIFI_MODE_AP
@@ -1555,7 +4827,11 @@ void app_main(void)
     task_start(camera_producer_task, "cam_producer", 6144, 6);
     if (lcd_ok) {
         task_start(lcd_preview_task, "lcd_preview", 6144, 2);
-    task_start(uart_cmd_task, "uart_cmd", 4096, 1);
+    /*
+     * uart_cmd 栈给 8192 —— 里面要跑 esp_http_client (自环测试),
+     * 那个库的 TLS/DNS/解析路径吃栈不少, 4096 会 stack overflow。
+     */
+    task_start(uart_cmd_task, "uart_cmd", 8192, 1);
     }
 #endif
 
