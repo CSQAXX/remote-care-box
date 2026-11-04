@@ -1328,6 +1328,20 @@ static void camera_power_reset(void)
     aw9523b_set_output(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_KEY_K1, false);
     aw9523b_set_output(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_KEY_K2, false);
 
+    /*
+     * P0 端口的输出驱动模式设为【推挽】。
+     *
+     * AW9523B 的 P0 默认是开漏 (Open-Drain), 需要板子上有外部上拉电阻。
+     * 正点原子 BOX3 的 P0 外部上拉只有部分脚有, K1/K2 所在的 P0_0/P0_1
+     * 实测读回恒为低 (INPUT P0 bit1 = 0), 说明这两脚没有有效的外部上拉,
+     * 结果是 button_task 永久卡在"等松开"循环 -> BOOT 物理按键事件永远
+     * 不生成, M2 验收直接卡死。
+     *
+     * 设成推挽后, 输出脚不再依赖外部上拉。虽然 K1/K2 是输入脚,
+     * 但把整个 P0 统一成推挽可以避免任何一脚在开漏状态下被拉死。
+     */
+    aw9523b_set_p0_push_pull(BOARD_I2C_PORT, AW9523B_I2C_ADDR, true);
+
     static const uint8_t power_outputs[] = {
         XIO_ESP_ADC_SEL,  /* XIO4  ADC 选择 */
         XIO_PA_CTRL,      /* XIO5  音频功放 */
@@ -2916,25 +2930,55 @@ static size_t encode_jpeg_to_slot(const uint8_t *rgb565, int w, int h, uint8_t *
 
 static esp_err_t root_handler(httpd_req_t *req)
 {
+    /*
+     * 需求文档 3.4 节要求的最小页面: 一个 <img> + 一个弹窗。
+     * 这里额外加了两点, 都是为了【验收时能一眼看懂】:
+     *   - 提示框做成醒目的卡片 (老人/评审一眼就能看到)
+     *   - 加一个连接状态灯, 能区分"没事件"和"设备没连上"
+     *
+     * 【踩过的坑】这段 JS 的花括号必须严格配平。
+     *   曾经多写了一个 '}', 导致整段脚本抛 SyntaxError,
+     *   页面看起来正常但轮询根本没启动 —— 按钮事件永远弹不出来。
+     *   教训: 内联 JS 一定要在浏览器控制台里确认没有红色报错。
+     */
     const char html[] =
         "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
         "<title>远程看护盒子</title>"
         "<style>body{font-family:sans-serif;margin:20px;background:#fafafa}"
         "img{border:2px solid #333;max-width:100%;background:#000}"
         "#alert{display:none;background:#ffe0e0;border:2px solid #d00;padding:16px;"
-        "margin-top:16px;font-size:20px;font-weight:bold}"
+        "margin-top:16px;font-size:20px;font-weight:bold;border-radius:8px}"
+        "#status{font-size:14px;color:#666;margin:8px 0}"
+        ".dot{display:inline-block;width:10px;height:10px;border-radius:50%;"
+        "background:#c00;margin-right:6px;vertical-align:middle}"
+        ".dot.on{background:#0a0}"
         "</style></head><body>"
         "<h2>远程看护盒子（可行性验证）</h2>"
+        "<div id=\"status\"><span class=\"dot\" id=\"dot\"></span>"
+        "<span id=\"statusText\">正在连接设备...</span></div>"
         "<img id=\"cam\" src=\"/stream\" width=\"320\" height=\"240\">"
         "<div id=\"alert\"></div>"
         "<script>"
-        "function poll(){fetch('/event').then(r=>r.json()).then(d=>{"
-        "if(d.type==='button'){var a=document.getElementById('alert');"
-        "a.textContent=d.msg;a.style.display='block';"
+        "var dot=document.getElementById('dot');"
+        "var st=document.getElementById('statusText');"
+        "var alertBox=document.getElementById('alert');"
+        "function poll(){"
+        "fetch('/event').then(function(r){return r.json();}).then(function(d){"
+        "dot.className='dot on';"
+        "st.textContent='设备在线';"
+        "if(d.type==='button'){"
+        "alertBox.textContent=d.msg;"
+        "alertBox.style.display='block';"
         "fetch('/notify',{method:'POST',body:d.msg});"
-        "setTimeout(function(){a.style.display='none';},8000);}}"
-        "}).catch(function(e){});}"
-        "setInterval(poll,500);poll();"
+        "setTimeout(function(){alertBox.style.display='none';},8000);"
+        "}"
+        "}).catch(function(e){"
+        "dot.className='dot';"
+        "st.textContent='连接中断,重试中...';"
+        "});"
+        "}"
+        "setInterval(poll,500);"
+        "poll();"
         "</script></body></html>";
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
@@ -2948,16 +2992,33 @@ static esp_err_t stream_handler(httpd_req_t *req)
     s_stream_clients++;
     ESP_LOGI(TAG, "画面客户端接入，当前 %d 个", s_stream_clients);
 
-    const char *headers =
-        "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
-        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
-        "Pragma: no-cache\r\n"
-        "Connection: close\r\n\r\n";
-
-    esp_err_t res = httpd_resp_send(req, headers, HTTPD_RESP_USE_STRLEN);
-    if (res != ESP_OK) {
-        goto cleanup;
-    }
+    /*
+     * 【踩过的坑】不能用 httpd_resp_send() 来发 multipart 响应头!
+     *
+     *   httpd_resp_send() 内部会【自己拼一整套 HTTP 响应头】:
+     *     HTTP/1.1 200 OK
+     *     Content-Type: text/html      <-- 默认类型
+     *     Content-Length: 148
+     *   然后才把你传进去的字符串当成【正文】发出去。
+     *
+     *   结果就是服务端一口气发了两个 HTTP 响应:
+     *     第一个: 200 OK, text/html, Content-Length: 148
+     *              正文是 "Content-Type: multipart/..." 这段字符串
+     *     第二个: 200 OK, chunked, 真正的 JPEG 数据
+     *
+     *   浏览器只认第一个响应, 把它当成"一个 148 字节的 text/html",
+     *   渲染出来就是一片空白 —— <img> 的 naturalWidth = 0。
+     *
+     *   正确做法:
+     *     - httpd_resp_set_type()  设置 Content-Type (只改头, 不发数据)
+     *     - httpd_resp_set_hdr()   设置额外的响应头
+     *     - httpd_resp_send_chunk() 用分块传输发数据 (自动带
+     *       Transfer-Encoding: chunked, 浏览器能正确解析 multipart 流)
+     */
+    httpd_resp_set_type(req, "multipart/x-mixed-replace; boundary=frame");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
     /*
      * 这里【不再】自己做 JPEG 编码 —— 生产者任务已经编好了, 我们只负责取。
@@ -2998,21 +3059,58 @@ static esp_err_t stream_handler(httpd_req_t *req)
         s_frame_count++;
     }
 
-cleanup:
     s_stream_clients--;
     ESP_LOGI(TAG, "画面客户端断开，剩余 %d 个", s_stream_clients);
     return ESP_OK;
 }
 
+/*
+ * 把一段文本安全地写进 JSON 字符串字面量。
+ *
+ * 为什么需要:
+ *   /event 直接把文案拼进 JSON。如果文案里有 " 或 \ 或控制字符,
+ *   拼出来的就是非法 JSON, 网页的 JSON.parse 会抛异常,
+ *   整条链路静默失效 (页面不报错, 只是永远不弹窗)。
+ *   中文本身没问题 (UTF-8 多字节直接透传即可), 要转义的是这些字符。
+ *
+ * 返回写入的字节数 (不含结尾的 '\0')。
+ */
+static int json_escape(char *dst, size_t dst_size, const char *src)
+{
+    size_t o = 0;
+    for (size_t i = 0; src[i] != '\0' && o + 7 < dst_size; i++) {
+        unsigned char c = (unsigned char)src[i];
+        switch (c) {
+        case '"':  dst[o++] = '\\'; dst[o++] = '"';  break;
+        case '\\': dst[o++] = '\\'; dst[o++] = '\\'; break;
+        case '\n': dst[o++] = '\\'; dst[o++] = 'n';  break;
+        case '\r': dst[o++] = '\\'; dst[o++] = 'r';  break;
+        case '\t': dst[o++] = '\\'; dst[o++] = 't';  break;
+        default:
+            if (c < 0x20) {
+                /* 其它控制字符用 \u00XX */
+                o += snprintf(dst + o, dst_size - o, "\\u%04x", c);
+            } else {
+                dst[o++] = (char)c;   /* 中文等 UTF-8 多字节原样透传 */
+            }
+            break;
+        }
+    }
+    dst[o] = '\0';
+    return (int)o;
+}
+
 static esp_err_t event_handler(httpd_req_t *req)
 {
-    char resp[256];
+    char resp[384];
+    char msg_esc[256];
 
     button_event_t ev;
     if (xQueueReceive(s_event_queue, &ev, 0) == pdTRUE) {
+        json_escape(msg_esc, sizeof(msg_esc), ev.message);
         snprintf(resp, sizeof(resp),
                  "{\"type\":\"button\",\"msg\":\"%s\",\"seq\":%u,\"ts\":%llu}",
-                 ev.message, (unsigned int)ev.seq, (unsigned long long)ev.ts_ms);
+                 msg_esc, (unsigned int)ev.seq, (unsigned long long)ev.ts_ms);
         ESP_LOGI(TAG, "取出一个按键事件: %s", ev.message);
     } else {
         snprintf(resp, sizeof(resp), "{\"type\":\"none\"}");
@@ -3932,11 +4030,24 @@ static void audio_selftest_loop(void)
  * console 的输出互不干扰 (console 的 stdout 走 UART0, 我们只读 USB RX)。
  * 输出仍然用 ESP_LOGI (走 IDF 的双路 console, COM3 上也能看到)。
  */
+/* 前置声明: inject_button_event / button_raw_dump 定义在 uart_cmd_task 之后 */
+static void inject_button_event(const char *msg);
+static void button_raw_dump(int seconds);
+static void aw9523b_dump_regs(void);
+static void aw_key_line_test(void);
+static void boot_button_simulate(void);
+
 static void uart_cmd_task(void *arg)
 {
-    char line[64];
+    /*
+     * 命令缓冲区放大到 256 字节。
+     *
+     * 原因: evtest 允许注入【中文文案】来验证 A6「文案可配置」。
+     * UTF-8 里一个汉字占 3 字节, 64 字节只够放 20 个字, 太紧;
+     * 256 字节能放 80+ 个汉字, 足够实际使用。
+     */
+    char line[256];
     int  len = 0;
-
     while (true) {
         uint8_t ch;
         int n = usb_serial_jtag_read_bytes(&ch, 1, pdMS_TO_TICKS(50));
@@ -4350,6 +4461,36 @@ static void uart_cmd_task(void *arg)
                     }
                 } else if (strcmp(line, "adcreg") == 0) {
                     audio_board_dump_adc_regs();
+                } else if (strncmp(line, "evtest", 5) == 0) {
+                    /*
+                     * 注入一条看护事件 (M2 链路自测)。
+                     *
+                     * evtest              -> 用默认文案 (BUTTON_MESSAGE)
+                     * evtest <自定义文案> -> 用自定义文案 (验证 A6 文案可配置)
+                     *
+                     * 注意: 串口命令行的分隔符是【空格】, 不是 tab,
+                     * 所以要用 strchr 找第一个空格, 不能假设是 line[5]。
+                     */
+                    const char *msg = BUTTON_MESSAGE;
+                    const char *sp = strchr(line, ' ');
+                    if (sp != NULL && sp[1] != '\0') {
+                        msg = sp + 1;
+                    }
+                    inject_button_event(msg);
+                } else if (strncmp(line, "btnraw", 6) == 0) {
+                    /*
+                     * 打印按键原始电平 (排障用)。
+                     *   btnraw       打印一次
+                     *   btnraw 30    连续打印 30 秒
+                     */
+                    int secs = (strlen(line) > 6) ? atoi(line + 6) : 1;
+                    button_raw_dump(secs);
+                } else if (strncmp(line, "awregs", 6) == 0) {
+                    aw9523b_dump_regs();
+                } else if (strncmp(line, "keytest", 7) == 0) {
+                    aw_key_line_test();
+                } else if (strncmp(line, "bootpress", 9) == 0) {
+                    boot_button_simulate();
                 } else {
                     ESP_LOGW(TAG, "未知命令: %s", line);
                     ESP_LOGW(TAG, "可用: lcd0/lcd1/lcd2/stat/q/hash/conv 0|1/pda 0|1/wifioff/wifix/astat/adcreg/tone/astop/vol N/mgain N/cgain N/scan/axtest");
@@ -4358,8 +4499,21 @@ static void uart_cmd_task(void *arg)
             }
             continue;
         }
-        if (ch >= 32 && ch < 127 && len < (int)sizeof(line) - 1) {
-            line[len++] = (char)ch;
+        /*
+         * 接受 ASCII 可见字符 + UTF-8 多字节序列 (>= 0x80)。
+         *
+         * 原来只收 32..126, 结果中文 (UTF-8 每个字 3 字节, 首字节 >= 0xE0)
+         * 被整段丢弃 —— 表现为 "evtest 奶奶说想喝水了" 传进去变成了
+         * "evtest "，自定义文案根本没生效。
+         *
+         * 这里只做"收下字节", 不做 UTF-8 合法性校验:
+         * 命令解析只按 ASCII 关键字匹配, 多字节内容整体透传,
+         * 最后由 JSON 输出和 UTF-8 终端去处理。
+         */
+        if ((ch >= 32 && ch < 127) || ch >= 0x80) {
+            if (len < (int)sizeof(line) - 1) {
+                line[len++] = (char)ch;
+            }
         }
     }
 }
@@ -4384,6 +4538,230 @@ static bool aw_key_state(uint8_t pin)
         return !high;
     }
     return false;
+}
+
+/*
+ * 【注入一个看护事件】—— 排障/自测用。
+ *
+ * 为什么需要:
+ *   M2 的验收标准是"按板子按钮, 网页弹出中文提示", 但这条链路有三个环节:
+ *     物理按键 -> GPIO 读取 -> 事件队列 -> /event 出队 -> 网页弹窗
+ *   每次验证都要人去按一下板子, 慢且不可重复。
+ *   而"网页到底能不能弹出来"这一段, 完全可以离线验证:
+ *   只要事件能进队列, /event 就能取出来, 网页就能弹。
+ *
+ * 所以提供一个"假装按了一下键"的命令, 把按键以外的两个环节独立验证。
+ * 物理按键那一段用 tools_m2_check.py 单独验 (或者直接看串口日志)。
+ *
+ * 用法:
+ *   evtest              注入一条默认文案的事件
+ *   evtest <自定义文案>  注入一条自定义文案的事件 (验证文案可配置)
+ */
+static void inject_button_event(const char *msg)
+{
+    button_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.has_event = true;
+    ev.seq = (uint32_t)(esp_timer_get_time() / 1000);
+    ev.ts_ms = esp_timer_get_time() / 1000;
+    snprintf(ev.message, sizeof(ev.message), "%s", msg);
+
+    if (xQueueSend(s_event_queue, &ev, 0) != pdTRUE) {
+        ESP_LOGE(TAG, "注入事件失败: 队列已满");
+        return;
+    }
+    ESP_LOGI(TAG, "已注入按键事件: %s", ev.message);
+}
+
+/*
+ * 【按键原始电平诊断】—— 排障用。
+ *
+ * 为什么需要:
+ *   "按了键没反应"这个问题, 光看事件日志只能看到"没产生事件",
+ *   不知道是【按键没被读到】还是【读到了但没生成事件】。
+ *   直接把三个键的原始电平打出来, 一眼就能定位:
+ *     - 电平一直是 1  -> 硬件/上拉/引脚配置问题 (按键根本没接通)
+ *     - 电平变 0 但没事件 -> 消抖或事件生成逻辑的问题
+ *
+ * 用法:
+ *   btnraw           打印一次当前电平
+ *   btnraw 30        连续打印 30 秒 (每秒一次), 便于按住键观察跳变
+ */
+static void button_raw_dump(int seconds)
+{
+    if (seconds <= 0) {
+        seconds = 1;
+    }
+    ESP_LOGI(TAG, "按键原始电平 (BOOT=GPIO%d 高=松开 低=按下)", BTN_BOOT_GPIO);
+    for (int i = 0; i < seconds; i++) {
+        int boot_lv = gpio_get_level(BTN_BOOT_GPIO);
+        int k1_lv = aw_key_state(XIO_KEY_K1) ? 0 : 1;
+        int k2_lv = aw_key_state(XIO_KEY_K2) ? 0 : 1;
+        ESP_LOGI(TAG, "  [%2d] BOOT=%d K1=%d K2=%d %s",
+                 i, boot_lv, k1_lv, k2_lv,
+                 (boot_lv == 0 || k1_lv == 0 || k2_lv == 0) ? "<== 有键按下" : "");
+        if (i + 1 < seconds) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+}
+
+/*
+ * 【AW9523B 原始寄存器快照】—— 排障用。
+ *
+ * 用途: 当按键电平出现"恒定按下"这种怪现象时, 光看应用层的电平不够,
+ * 必须把芯片的原始寄存器摊开看, 才能分清是:
+ *   - CONFIG 方向位配错了 (该输入的脚被配成输出)
+ *   - INPUT 寄存器读回的值本身就不对 (硬件上拉/外部电路问题)
+ *   - 读 I2C 失败时上层拿到的是"假的高电平"
+ */
+static void aw9523b_dump_regs(void)
+{
+    uint8_t in0 = 0, in1 = 0, out0 = 0, out1 = 0, cfg0 = 0, cfg1 = 0, id = 0;
+
+    if (aw9523b_read_raw(BOARD_I2C_PORT, AW9523B_I2C_ADDR, AW9523B_REG_INPUT_P0, &in0) != ESP_OK ||
+        aw9523b_read_raw(BOARD_I2C_PORT, AW9523B_I2C_ADDR, AW9523B_REG_INPUT_P1, &in1) != ESP_OK ||
+        aw9523b_read_raw(BOARD_I2C_PORT, AW9523B_I2C_ADDR, AW9523B_REG_OUTPUT_P0, &out0) != ESP_OK ||
+        aw9523b_read_raw(BOARD_I2C_PORT, AW9523B_I2C_ADDR, AW9523B_REG_OUTPUT_P1, &out1) != ESP_OK ||
+        aw9523b_read_raw(BOARD_I2C_PORT, AW9523B_I2C_ADDR, AW9523B_REG_CONFIG_P0, &cfg0) != ESP_OK ||
+        aw9523b_read_raw(BOARD_I2C_PORT, AW9523B_I2C_ADDR, AW9523B_REG_CONFIG_P1, &cfg1) != ESP_OK ||
+        aw9523b_read_raw(BOARD_I2C_PORT, AW9523B_I2C_ADDR, AW9523B_REG_ID, &id) != ESP_OK) {
+        ESP_LOGE(TAG, "AW9523B 寄存器读取失败 (I2C 通信异常)");
+        return;
+    }
+
+    ESP_LOGI(TAG, "AW9523B 寄存器: ID=0x%02x", id);
+    ESP_LOGI(TAG, "  INPUT   P0=0x%02x P1=0x%02x   (1=高电平)", in0, in1);
+    ESP_LOGI(TAG, "  OUTPUT  P0=0x%02x P1=0x%02x", out0, out1);
+    ESP_LOGI(TAG, "  CONFIG  P0=0x%02x P1=0x%02x   (1=输入 0=输出)", cfg0, cfg1);
+    ESP_LOGI(TAG, "  K1(XIO0) 输入电平=%d, K2(XIO1) 输入电平=%d",
+             (in0 & 0x01) ? 1 : 0, (in0 & 0x02) ? 1 : 0);
+
+    uint8_t ctl = 0;
+    if (aw9523b_read_raw(BOARD_I2C_PORT, AW9523B_I2C_ADDR, AW9523B_REG_CTL, &ctl) == ESP_OK) {
+        ESP_LOGI(TAG, "  CTL(0x11)=0x%02x  P0驱动模式=%s", ctl,
+                 (ctl & AW9523B_CTL_GPOMD_BIT) ? "推挽" : "开漏");
+    }
+    uint8_t led0 = 0, led1 = 0;
+    if (aw9523b_read_raw(BOARD_I2C_PORT, AW9523B_I2C_ADDR, 0x12, &led0) == ESP_OK &&
+        aw9523b_read_raw(BOARD_I2C_PORT, AW9523B_I2C_ADDR, 0x13, &led1) == ESP_OK) {
+        ESP_LOGI(TAG, "  LED模式 P0=0x%02x P1=0x%02x  (1=GPIO 0=LED)", led0, led1);
+        ESP_LOGI(TAG, "  K1(bit0)=%s, K2(bit1)=%s  <== 若为 LED 模式则该脚被恒定拉低!",
+                 (led0 & 0x01) ? "GPIO" : "LED",
+                 (led0 & 0x02) ? "GPIO" : "LED");
+    }
+    ESP_LOGI(TAG, "  期望: K1/K2 都是输入 (CONFIG P0 bit0/bit1 = 1), 输入电平均为 1 (松开)");
+}
+
+/*
+ * 【按键脚硬连线测试】—— 排障用。
+ *
+ * 背景:
+ *   实测 XIO1 (K2) 的输入电平恒为 0, 而 XIO0 (K1) 恒为 1。
+ *   AW9523B 没有内部上拉寄存器, 所以 K2 读低只有两种可能:
+ *     a) 这个脚被硬短接到 GND (按键卡死 / 板上焊接问题)
+ *     b) 这个脚没有外部上拉, 悬空时被读成低
+ *
+ * 怎么区分:
+ *   把该脚临时配成【输出推挽】并驱动高电平, 然后回读 INPUT 寄存器。
+ *   - 读回 1  -> 脚没有被短到 GND, 只是缺上拉 (情况 b)
+ *   - 读回 0  -> 脚被硬短到 GND (情况 a), 按键/硬件坏了
+ *
+ * 注意:
+ *   - 测试期间【不要按键】。推挽输出高电平时如果按键按下, 会把输出直接
+ *     短到 GND, 对芯片不好。
+ *   - 测试完立刻恢复成输入模式。
+ */
+static void aw_key_line_test(void)
+{
+    const uint8_t pins[2] = { XIO_KEY_K1, XIO_KEY_K2 };
+    const char *names[2] = { "K1(XIO0)", "K2(XIO1)" };
+
+    for (int i = 0; i < 2; i++) {
+        uint8_t pin = pins[i];
+
+        /* 保存当前配置, 测完还原 */
+        uint8_t cfg0 = 0, cfg1 = 0;
+        aw9523b_get_config(BOARD_I2C_PORT, AW9523B_I2C_ADDR, &cfg0, &cfg1);
+
+        /* 配成输出推挽, 驱动高电平 */
+        aw9523b_set_output(BOARD_I2C_PORT, AW9523B_I2C_ADDR, pin, true);
+        aw9523b_set_level(BOARD_I2C_PORT, AW9523B_I2C_ADDR, pin, true);
+        vTaskDelay(pdMS_TO_TICKS(20));
+
+        uint8_t in0 = 0;
+        if (aw9523b_read_raw(BOARD_I2C_PORT, AW9523B_I2C_ADDR, AW9523B_REG_INPUT_P0, &in0) == ESP_OK) {
+            int lvl = (in0 & (1u << (pin & 0x07))) ? 1 : 0;
+            ESP_LOGI(TAG, "  %s 驱动高电平后回读=%d  => %s", names[i], lvl,
+                     lvl ? "没有硬短到 GND (只是缺上拉)" : "被硬短到 GND (按键/硬件故障)");
+        } else {
+            ESP_LOGE(TAG, "  %s 回读失败", names[i]);
+        }
+
+        /* 还原成输入 */
+        aw9523b_set_output(BOARD_I2C_PORT, AW9523B_I2C_ADDR, pin, false);
+        vTaskDelay(pdMS_TO_TICKS(20));
+
+        /* 还原后再读一次, 看看是不是真的没上拉 */
+        in0 = 0;
+        if (aw9523b_read_raw(BOARD_I2C_PORT, AW9523B_I2C_ADDR, AW9523B_REG_INPUT_P0, &in0) == ESP_OK) {
+            ESP_LOGI(TAG, "  %s 还原成输入后回读=%d", names[i],
+                     (in0 & (1u << (pin & 0x07))) ? 1 : 0);
+        }
+    }
+    ESP_LOGI(TAG, "  (测试期间请不要按键)");
+}
+
+/*
+ * 【模拟按 BOOT 键】—— 排障/自测用。
+ *
+ * 背景:
+ *   M2 的验收标准是"按板子按钮, 网页弹出中文提示", 但每次都要人工去按,
+ *   慢且不可重复。而"BOOT 电平变低 -> 生成事件 -> 网页弹出"这一整条链路
+ *   除了最后那一下手指, 全部是软件, 可以自己闭环验证。
+ *
+ * 做法:
+ *   1. 把 GPIO0 临时配成【输出】, 先驱动高电平 (安全, 不会误进下载模式)
+ *   2. 拉低 100ms —— 这模拟"按下"
+ *   3. 立刻恢复成【输入 + 上拉】—— 这模拟"松开"
+ *
+ * 注意:
+ *   - GPIO0 是 strapping 引脚, 上电瞬间为低会进下载模式。
+ *     但此时系统已经启动完成, 短暂拉低不会触发复位, 恢复正常配置后也不受影响。
+ *   - 恢复成输入上拉后, 由内部上拉决定电平, 与真实按键状态一致。
+ */
+static void boot_button_simulate(void)
+{
+    gpio_config_t out_cfg = {
+        .pin_bit_mask = (1ULL << BTN_BOOT_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ESP_LOGI(TAG, "模拟按下 BOOT 键 (GPIO%d)", BTN_BOOT_GPIO);
+
+    /* 先驱动高, 再拉低 —— 避免出现低电平瞬间被当成复位请求 */
+    gpio_config(&out_cfg);
+    gpio_set_level(BTN_BOOT_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    gpio_set_level(BTN_BOOT_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(150));
+    gpio_set_level(BTN_BOOT_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    /* 恢复成输入上拉, 与真实状态一致 */
+    gpio_config_t in_cfg = {
+        .pin_bit_mask = (1ULL << BTN_BOOT_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&in_cfg);
+
+    ESP_LOGI(TAG, "已恢复 BOOT 键为输入上拉");
 }
 
 /*
@@ -4416,31 +4794,84 @@ static void button_task(void *arg)
     ESP_LOGI(TAG, "按键已配置 (BOOT=GPIO%d=事件, K1(XIO%d)=音量-, K2(XIO%d)=音量+)",
              BTN_BOOT_GPIO, XIO_KEY_K1, XIO_KEY_K2);
 
+    /*
+     * 每个键单独跟踪"上一次是否按下", 各自独立消抖。
+     *
+     * 为什么不用"三个键都松开才算一次操作结束"那种写法:
+     *   那种写法下, 只要有一个键的电平卡在低 (硬件故障 / 外部拉低 /
+     *   上拉没配好), 整个循环就永远出不来 —— 结果是另外两个正常的键
+     *   也再也产生不了事件。
+     *   实测就踩过这个坑: XIO1/K2 输入电平恒为 0, 结果 BOOT 物理按键
+     *   的看护事件永远不生成, M2 验收直接卡死。
+     *
+     * 独立跟踪之后, 一个坏掉的键只会影响它自己, 不会再连累别人。
+     *
+     * 【armed 机制】
+     *   AW9523B 没有内部上拉寄存器, K2 所在的 XIO1 在板上没有外部上拉,
+     *   浮空时被读成低电平 (keytest 证明它并没有硬短到 GND)。
+     *   如果直接拿"按下"当边沿, 开机那一刻就会误判成"按下了 K2"。
+     *
+     *   所以每个键都先"武装": 必须先观察到一次松开(高电平), 才认为
+     *   后续的低电平是真实的按下。浮空的键永远等不到武装, 于是它
+     *   既不会误触发, 也不会影响其他键。
+     */
+    bool prev_boot = false;
+    bool prev_k1   = false;
+    bool prev_k2   = false;
+    bool armed_boot = false;   /* 见过松开才武装 */
+    bool armed_k1   = false;
+    bool armed_k2   = false;
+
     while (true) {
         bool boot_down = (gpio_get_level(BTN_BOOT_GPIO) == 0);
         bool k1_down    = aw_key_state(XIO_KEY_K1);
         bool k2_down    = aw_key_state(XIO_KEY_K2);
 
-        if (boot_down || k1_down || k2_down) {
+        /* ---- 武装: 观察到高电平(松开)才认为后续的低电平是真实按下 ---- */
+        if (!boot_down) armed_boot = true;
+        if (!k1_down)   armed_k1   = true;
+        if (!k2_down)   armed_k2   = true;
+
+        /* ---- BOOT 键: 产生看护事件 (按下瞬间触发, 松开重置) ---- */
+        if (boot_down && !prev_boot && armed_boot) {
+            vTaskDelay(pdMS_TO_TICKS(30));     /* 消抖: 30ms 后还在按下才算数 */
+
+            if (gpio_get_level(BTN_BOOT_GPIO) == 0) {
+                uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+                if (now - last_event_ms >= 300) {
+                    last_event_ms = now;
+
+                    button_event_t ev;
+                    memset(&ev, 0, sizeof(ev));
+                    ev.has_event = true;
+                    ev.seq = now;
+                    ev.ts_ms = esp_timer_get_time() / 1000;
+                    snprintf(ev.message, sizeof(ev.message), "%s", BUTTON_MESSAGE);
+
+                    ESP_LOGI(TAG, "检测到 BOOT 按键按下，生成事件: %s", ev.message);
+                    xQueueSend(s_event_queue, &ev, 0);
+                }
+            }
+        }
+        prev_boot = boot_down;
+
+        /* ---- K1/K2: 音量调节 (松开时触发, 避免长按连发) ---- */
+        if (k1_down != prev_k1 || k2_down != prev_k2) {
             vTaskDelay(pdMS_TO_TICKS(30));
 
-            /* 等到松开 (三个键都松开才算一次操作结束) */
-            while (gpio_get_level(BTN_BOOT_GPIO) == 0 ||
-                   aw_key_state(XIO_KEY_K1) ||
-                   aw_key_state(XIO_KEY_K2)) {
-                vTaskDelay(pdMS_TO_TICKS(20));
-            }
+            bool k1_now = aw_key_state(XIO_KEY_K1);
+            bool k2_now = aw_key_state(XIO_KEY_K2);
 
-            uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-            if (now - last_event_ms < 300) {
-                continue;
-            }
-            last_event_ms = now;
+            if (k1_now != prev_k1 || k2_now != prev_k2) {
+                /*
+                 * 只有【已武装】的键才参与音量调节。
+                 * 未武装 = 从开机到现在从没观察到松开 = 该脚悬空/故障,
+                 * 不能拿它的低电平去改音量 (否则开机就自动加音量)。
+                 */
+                bool k1_valid = armed_k1 || k1_now;
+                bool k2_valid = armed_k2 || k2_now;
 
-            /* ---- 音量调节 (优先级高于事件) ---- */
-            if (k1_down || k2_down) {
-                int step = (k1_down && k2_down) ? 0 : (k1_down ? -10 : +10);
-                if (step == 0) {
+                if (k1_valid && k2_valid) {
                     /* 两个键同时按 = 静音/取消静音 */
                     int v = audio_board_get_output_volume();
                     if (v <= 0) {
@@ -4450,29 +4881,29 @@ static void button_task(void *arg)
                         audio_board_set_output_volume(0);
                         ESP_LOGI(TAG, "静音");
                     }
-                } else {
+                } else if (k1_valid) {
                     int v = audio_board_get_output_volume();
-                    if (v < 0) v = 60;      /* 音频没起来, 从默认值起步 */
-                    v += step;
+                    if (v < 0) v = 60;
+                    v -= 10;
                     if (v < 0) v = 0;
+                    if (audio_board_set_output_volume(v) == 0) {
+                        ESP_LOGI(TAG, "输出音量 = %d", v);
+                    }
+                } else if (k2_valid) {
+                    int v = audio_board_get_output_volume();
+                    if (v < 0) v = 60;
+                    v += 10;
                     if (v > 100) v = 100;
                     if (audio_board_set_output_volume(v) == 0) {
                         ESP_LOGI(TAG, "输出音量 = %d", v);
                     }
+                } else {
+                    ESP_LOGW(TAG, "K1/K2 状态不可信 (未观察到松开), 忽略本次音量操作");
                 }
-                continue;   /* 音量操作不产生看护事件 */
             }
 
-            /* ---- 看护事件 ---- */
-            button_event_t ev;
-            memset(&ev, 0, sizeof(ev));
-            ev.has_event = true;
-            ev.seq = now;
-            ev.ts_ms = esp_timer_get_time() / 1000;
-            snprintf(ev.message, sizeof(ev.message), "%s", BUTTON_MESSAGE);
-
-            ESP_LOGI(TAG, "检测到按键按下，生成事件: %s", ev.message);
-            xQueueSend(s_event_queue, &ev, 0);
+            prev_k1 = k1_now;
+            prev_k2 = k2_now;
         }
 
         vTaskDelay(pdMS_TO_TICKS(50));

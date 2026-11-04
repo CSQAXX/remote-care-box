@@ -149,3 +149,23 @@ esp_err_t aw9523b_write_output_p1(i2c_port_t port, uint8_t addr, uint8_t val)
 {
     return write_reg(port, addr, AW9523B_REG_OUTPUT_P1, val);
 }
+
+esp_err_t aw9523b_set_p0_push_pull(i2c_port_t port, uint8_t addr, bool push_pull)
+{
+    uint8_t ctl = 0;
+    esp_err_t err = read_reg(port, addr, AW9523B_REG_CTL, &ctl);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (push_pull) {
+        ctl |= AW9523B_CTL_GPOMD_BIT;
+    } else {
+        ctl &= (uint8_t)~AW9523B_CTL_GPOMD_BIT;
+    }
+    return write_reg(port, addr, AW9523B_REG_CTL, ctl);
+}
+
+esp_err_t aw9523b_get_ctl(i2c_port_t port, uint8_t addr, uint8_t *val)
+{
+    return read_reg(port, addr, AW9523B_REG_CTL, val);
+}

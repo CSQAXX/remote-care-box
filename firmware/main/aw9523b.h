@@ -44,6 +44,18 @@ extern "C" {
 #define AW9523B_REG_ID          0x10
 #define AW9523B_REG_SW_RSTN     0x7F
 
+/*
+ * 全局控制寄存器 (0x11)。
+ *
+ * bit4 (GPOMD): P0 端口的输出驱动模式。
+ *   0 = 开漏 (默认, 需要外部上拉电阻)
+ *   1 = 推挽 (不需要外部上拉)
+ * 注意: 只影响【输出】脚。输入脚的电平始终由外部电路决定,
+ *       AW9523B 没有内部上拉使能寄存器。
+ */
+#define AW9523B_REG_CTL         0x11
+#define AW9523B_CTL_GPOMD_BIT   0x10
+
 #define AW9523B_CHIP_ID         0x23
 
 #define AW9523B_TIMEOUT_MS      100
@@ -98,6 +110,17 @@ esp_err_t aw9523b_read_raw(i2c_port_t port, uint8_t addr, uint8_t reg, uint8_t *
  * @brief 直接写 OUTPUT_P1 寄存器 (诊断用)
  */
 esp_err_t aw9523b_write_output_p1(i2c_port_t port, uint8_t addr, uint8_t val);
+
+/**
+ * @brief 设置 P0 端口的输出驱动模式
+ * @param push_pull true=推挽 (不依赖外部上拉), false=开漏 (默认)
+ */
+esp_err_t aw9523b_set_p0_push_pull(i2c_port_t port, uint8_t addr, bool push_pull);
+
+/**
+ * @brief 读回全局控制寄存器 (调试用)
+ */
+esp_err_t aw9523b_get_ctl(i2c_port_t port, uint8_t addr, uint8_t *val);
 
 #ifdef __cplusplus
 }
