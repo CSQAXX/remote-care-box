@@ -4725,10 +4725,11 @@ static void aw_key_line_test(void)
  *   2. 拉低 100ms —— 这模拟"按下"
  *   3. 立刻恢复成【输入 + 上拉】—— 这模拟"松开"
  *
- * 注意:
- *   - GPIO0 是 strapping 引脚, 上电瞬间为低会进下载模式。
- *     但此时系统已经启动完成, 短暂拉低不会触发复位, 恢复正常配置后也不受影响。
- *   - 恢复成输入上拉后, 由内部上拉决定电平, 与真实按键状态一致。
+ * 【重要】为什么必须先驱动高再拉低:
+ *   GPIO0 是 strapping 引脚, 上电瞬间为低会进下载模式。
+ *   虽然系统启动后不会因此复位, 但"瞬间拉低"这种写法在某些时序下
+ *   会被硬件复位电路捕捉到, 表现为设备莫名其妙重启。
+ *   所以先输出高 (100ms), 确认稳定后再拉低。
  */
 static void boot_button_simulate(void)
 {
@@ -4742,14 +4743,14 @@ static void boot_button_simulate(void)
 
     ESP_LOGI(TAG, "模拟按下 BOOT 键 (GPIO%d)", BTN_BOOT_GPIO);
 
-    /* 先驱动高, 再拉低 —— 避免出现低电平瞬间被当成复位请求 */
+    /* 先驱动高, 稳定 100ms, 再拉低 —— 避免 strapping 引脚瞬间拉低导致复位 */
     gpio_config(&out_cfg);
     gpio_set_level(BTN_BOOT_GPIO, 1);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(100));
     gpio_set_level(BTN_BOOT_GPIO, 0);
     vTaskDelay(pdMS_TO_TICKS(150));
     gpio_set_level(BTN_BOOT_GPIO, 1);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(100));
 
     /* 恢复成输入上拉, 与真实状态一致 */
     gpio_config_t in_cfg = {
