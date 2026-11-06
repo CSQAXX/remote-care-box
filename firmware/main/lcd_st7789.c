@@ -18,6 +18,8 @@
 static const char *TAG = "lcd";
 
 static esp_lcd_panel_handle_t s_panel = NULL;
+static esp_lcd_panel_io_handle_t s_io = NULL;   /* 保存 io 句柄, 用于运行时重建面板 */
+static int s_lcd_spi_hz = 60 * 1000 * 1000;     /* 当前 SPI 时钟, 重建时用 */
 
 /* ST7789 一帧 RGB565 是 320*240*2 = 153600 字节
  * 注意: SPI 的 max_transfer_sz 决定 DMA 缓冲大小，内部 RAM 紧张，
@@ -37,8 +39,13 @@ static esp_lcd_panel_handle_t s_panel = NULL;
  *
  * 改成 20 行: 批缓冲 = 12800 字节, 稳稳落在上限一半,
  * 远离边界。代价只是批次多一倍 (240 行 -> 12 批), 开销可以忽略。
+ *
+ * 【2026-11-05】进一步降到 10 行 (6400 字节/块, 两块共 12800 字节)。
+ * 原因不是 SPI 边界, 而是【内部 RAM 不够】:
+ * 这块板子开机实测内部 RAM 只剩 16983 字节, 两块 12800 字节的缓冲
+ * 直接申请失败 -> 屏幕全黑。降到 10 行后占用减半, 才有余量。
+ * 批次变成 24 批, 但每批只有 6400 字节, 总传输量不变, 帧率基本不受影响。
  */
-#define LCD_BATCH_LINES  20
 /*
  * SPI 单次 DMA 传输的上限。
  *
@@ -76,41 +83,130 @@ static esp_lcd_panel_handle_t s_panel = NULL;
 static SemaphoreHandle_t s_lcd_dma_done = NULL;  /* 已传完的批次数 */
 static SemaphoreHandle_t s_lcd_mutex    = NULL;  /* 互斥量: 防止多任务同时画 */
 
+/*
+ * 【2026-11-05 修复黑屏】常驻的双缓冲, 不再每帧 malloc/free。
+ *
+ * ---------------------------------------------------------------------------
+ * 症状: 屏幕全黑, 串口每秒刷几十条:
+ *     E lcd: LCD 双缓冲分配失败
+ *     W kanhu: LCD 直绘失败: ESP_ERR_NO_MEM
+ *
+ * 根因: lcd_draw_rgb565() 每画一帧就 malloc 2 块 12800 字节的内部 DMA 缓冲,
+ *       画完再 free。开机实测内部 RAM 只剩 16983 字节, 而双缓冲需要
+ *       2 x 12800 = 25600 字节 —— 【根本不够】, 所以每一帧都申请失败,
+ *       屏幕从来没有被成功画过一张, 自然全黑。
+ *
+ * 为什么之前能显示:
+ *   之前的固件里有一块【从来没被用过】的诊断副本缓冲 (38400 字节内部 RAM),
+ *   加上其他零散分配, 内部 RAM 一直很紧。这个 bug 被别的内存问题掩盖着。
+ *
+ * 修复:
+ *   1) 缓冲改为【模块级常驻】, 只在 lcd_init() 里分配一次, 永远不释放。
+ *      这样内部 RAM 的占用是【固定的、可预算的】, 不会因为某一帧
+ *      内存紧张就整屏画不出来。
+ *   2) 批量行数从 20 降到 10, 每块缓冲 6400 字节, 两块共 12800 字节,
+ *      给 Wi-Fi / 音频 / 摄像头留出余量。
+ *   3) 分配失败时【不清屏也不报错刷屏】, 只跳过这一帧 —— 内存紧张是
+ *      常态, 刷屏会把系统拖垮, 而跳过一帧人眼根本看不出来。
+ * ---------------------------------------------------------------------------
+ */
+#define LCD_BATCH_LINES  10   /* 每批 10 行 -> 320*10*2 = 6400 字节/块 */
+#define LCD_BUF_COUNT    2     /* 双缓冲 */
+#define LCD_BUF_BYTES    ((size_t)LCD_WIDTH * LCD_BATCH_LINES * sizeof(uint16_t))
+
+static uint16_t *s_lcd_bufs[LCD_BUF_COUNT] = { NULL };
+static bool     s_lcd_buf_ready = false;
+
 /* SPI 传完一批颜色数据时回调 (在中断上下文触发) */
 /*
- * SPI 一批颜色数据传完时的回调 (由 esp_lcd 的 post_cb 触发)。
+ * SPI 一批颜色数据传完时的回调。
  *
- * 关键: 这个回调运行在【SPI 驱动任务的上下文】, 是普通任务, 不是 ISR。
- * 所以必须用 xSemaphoreGive (普通版), 不能用 xSemaphoreGiveFromISR。
+ * ---------------------------------------------------------------------------
+ * 【关键修复】这个回调运行在【中断上下文 (ISR)】!
  *
- * 之前误用了 GiveFromISR, 后果是信号量计数错乱:
- *   "DMA 还没传完" 的信号被提前发出 -> 下一批数据覆写了正在被 DMA 读取的 buf
- *   -> 画面出现随机撕裂/花屏 (表现为"偶尔闪一下、下方花")。
+ * IDF 源码链路:
+ *   spi_intr()  (中断服务函数)
+ *     -> spi_post_trans()
+ *       -> dev->cfg.post_cb(cur_trans)          <- 我们的回调
+ *         -> lcd_spi_post_trans_color_cb()
+ *           -> on_color_trans_done()
  *
- * esp-idf 的 post_cb 源码 (esp_lcd_panel_io_spi.c):
- *   static void lcd_spi_post_trans_color_cb(spi_transaction_t *trans) {
- *       ...
- *       spi_panel_io->on_color_trans_done(&spi_panel_io->base, NULL, ...);
- *   }
+ * 之前的注释说"这个回调运行在 SPI 驱动任务的上下文, 是普通任务, 不是 ISR"——
+ * 【这是错的】! 那是老版本 IDF 的行为, IDF v5.x 的 spi_post_trans 明确
+ * 是在 spi_intr 里调用的 (esp_driver_spi/src/gpspi/spi_master.c)。
+ *
+ * 在 ISR 里调用 xSemaphoreGive() (任务版) 是未定义行为:
+ *   - 它会操作 FreeRTOS 的任务调度器状态, 在中断里做这件事会破坏内核状态
+ *   - 实测表现: 信号量计数错乱 -> "DMA 还没传完" 的信号提前发出
+ *     -> 下一批数据覆写了正在被 DMA 读取的 buf
+ *     -> 面板收到新旧混合的数据 -> 画面被切成一条条横条 / 花屏
+ *
+ * 这与实测现象完全吻合:
+ *   - 浏览器里的 MJPEG 画面【完全干净】(JPEG 编码器和 LCD 读同一个 fb->buf)
+ *   - 只有 LCD 画面花
+ *   => 摄像头数据没问题, 问题在 LCD 的 SPI 发送路径 -> 就是这个 buf 复用竞争
+ *
+ * 修复: 改用中断安全的 xSemaphoreGiveFromISR(),
+ *       并在中断退出时请求一次任务调度 (portYIELD_FROM_ISR)。
  */
 static bool lcd_color_trans_done_cb(esp_lcd_panel_io_handle_t panel_io,
                                     esp_lcd_panel_io_event_data_t *edata,
                                     void *user_ctx)
 {
-    xSemaphoreGive(s_lcd_dma_done);
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    if (s_lcd_dma_done != NULL) {
+        xSemaphoreGiveFromISR(s_lcd_dma_done, &higher_priority_task_woken);
+        if (higher_priority_task_woken == pdTRUE) {
+            portYIELD_FROM_ISR();
+        }
+    }
     return false;
 }
 
 esp_err_t lcd_init(void)
 {
-    /* 同步原语: 统计"已传完的批次数" */
-    s_lcd_dma_done = xSemaphoreCreateCounting(10, 0);
-    s_lcd_mutex    = xSemaphoreCreateMutex();
+    /*
+     * 同步原语: 统计"已传完的批次数"。
+     * 只在第一次创建 —— 运行时改 SPI 时钟会重建面板, 那时不能重建信号量,
+     * 否则正在等待的绘制任务手里的信号量句柄就失效了。
+     */
+    if (s_lcd_dma_done == NULL) {
+        s_lcd_dma_done = xSemaphoreCreateCounting(10, 0);
+    }
+    if (s_lcd_mutex == NULL) {
+        s_lcd_mutex = xSemaphoreCreateMutex();
+    }
     if (s_lcd_dma_done == NULL || s_lcd_mutex == NULL) {
         ESP_LOGE(TAG, "创建 LCD 同步信号量失败");
         return ESP_ERR_NO_MEM;
     }
 
+    /*
+     * 【2026-11-05 修复黑屏】常驻双缓冲, 在这里一次性分配。
+     *
+     * 之前是每帧 malloc/free, 内部 RAM 紧张时申请失败 -> 屏幕全黑。
+     * 现在占用固定 (2 x 6400 = 12800 字节内部 DMA 内存), 可预算。
+     *
+     * 只分配一次: 运行时改 SPI 时钟会重建面板, 但缓冲不用重���。
+     */
+    if (!s_lcd_buf_ready) {
+        for (int i = 0; i < LCD_BUF_COUNT; i++) {
+            s_lcd_bufs[i] = heap_caps_malloc(LCD_BUF_BYTES,
+                                             MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+            if (s_lcd_bufs[i] == NULL) {
+                ESP_LOGE(TAG, "LCD 常驻缓冲分配失败 (%d 字节 x %d)",
+                         (int)LCD_BUF_BYTES, LCD_BUF_COUNT);
+                for (int j = 0; j < i; j++) {
+                    free(s_lcd_bufs[j]);
+                    s_lcd_bufs[j] = NULL;
+                }
+                return ESP_ERR_NO_MEM;
+            }
+        }
+        s_lcd_buf_ready = true;
+        ESP_LOGI(TAG, "LCD 常驻缓冲就绪: %d 块 x %d 字节 (内部DMA)",
+                 LCD_BUF_COUNT, (int)LCD_BUF_BYTES);
+    }
     spi_bus_config_t bus_cfg = {
         .mosi_io_num     = LCD_MOSI_PIN,
         .miso_io_num     = LCD_MISO_PIN,
@@ -131,7 +227,7 @@ esp_err_t lcd_init(void)
         .cs_gpio_num             = LCD_CS_PIN,
         .dc_gpio_num             = LCD_DC_PIN,
         .spi_mode                = 0,
-        .pclk_hz                 = 60 * 1000 * 1000,
+        .pclk_hz                 = s_lcd_spi_hz,
         .trans_queue_depth       = 7,
         /* 必须注册这个回调, 否则不知道一批颜色数据何时真正传完, buf 复用会撕裂画面 */
         .on_color_trans_done     = lcd_color_trans_done_cb,
@@ -154,6 +250,17 @@ esp_err_t lcd_init(void)
         ESP_LOGE(TAG, "esp_lcd_new_panel_io_spi 失败: %s", esp_err_to_name(err));
         return err;
     }
+
+    /*
+     * 记住 io 句柄, 这样运行时可以重建面板来改 SCLK 频率 (A/B 定位用)。
+     *
+     * 背景: 官方正点原子例子用 60MHz, 但那是给他们的板子 (走 LCD 自己的
+     * 时钟线) 调的。BOX3 的排线和电源噪声条件下, 60MHz 有可能在长
+     * 传输时出现采样错误 -> 花屏。把频率降下来是很好的对照实验。
+     *
+     * IDF 5.3 没有 spi_device_set_clock, 只能删掉设备重新加。
+     */
+    s_io = io;
 
     esp_lcd_panel_dev_config_t panel_cfg = {
         .reset_gpio_num = -1,
@@ -209,6 +316,62 @@ esp_err_t lcd_init(void)
     return ESP_OK;
 }
 
+/*
+ * 运行时调节 LCD 的 SPI 时钟频率 (A/B 对照用)。
+ *
+ * 用途: 官方用 60MHz; 如果在 BOX3 的排线/电源条件下 60MHz 会采样出错,
+ *       降频后画面应该立刻变干净。用这个命令可以在不重新烧录的情况下
+ *       快速定位"是不是 SPI 时钟太快"。
+ *
+ * IDF 5.3 没有 spi_device_set_clock(), 所以只能把面板整体重建:
+ *   删掉 panel + io -> 重新 spi_bus_add_device (新频率) -> 重新 init。
+ */
+esp_err_t lcd_set_spi_clock(int hz)
+{
+    if (hz < 1000000 || hz > 80000000) {
+        ESP_LOGE(TAG, "频率要在 1MHz~80MHz 之间");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_panel == NULL || s_io == NULL) {
+        ESP_LOGE(TAG, "LCD 还没初始化");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (hz == s_lcd_spi_hz) {
+        ESP_LOGI(TAG, "SPI 时钟已经是 %d Hz", hz);
+        return ESP_OK;
+    }
+
+    /* 先停掉正在进行的传输, 避免删除设备时还有事务在飞 */
+    xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+    while (xSemaphoreTake(s_lcd_dma_done, 0) == pdTRUE) {
+        /* 清空计数 */
+    }
+    xSemaphoreGive(s_lcd_mutex);
+
+    /* 删掉旧面板和 io */
+    if (s_panel) {
+        esp_lcd_panel_del(s_panel);
+        s_panel = NULL;
+    }
+    if (s_io) {
+        esp_lcd_panel_io_del(s_io);
+        s_io = NULL;
+    }
+    /* 注意: esp_lcd_panel_io_del() 内部已经会 spi_bus_remove_device(),
+     * 所以这里不能也不需要再手动移除 SPI 设备。 */
+
+    s_lcd_spi_hz = hz;
+
+    /* 重新初始化面板 (复用 lcd_init 的核心逻辑) */
+    esp_err_t err = lcd_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "以 %d Hz 重建 LCD 失败: %s", hz, esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "LCD SPI 时钟已设为 %d Hz", hz);
+    return ESP_OK;
+}
+
 esp_err_t lcd_fill_rect(int x, int y, int w, int h, uint16_t color)
 {
     if (s_panel == NULL) {
@@ -222,12 +385,25 @@ esp_err_t lcd_fill_rect(int x, int y, int w, int h, uint16_t color)
         return ESP_OK;
     }
 
-    /* 一次只处理一批行，缓冲放在内部 RAM (DMA 需要) */
-    size_t buf_len = (size_t)w * LCD_BATCH_LINES * sizeof(uint16_t);
-    uint16_t *buf = heap_caps_malloc(buf_len, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    if (buf == NULL) {
+    /*
+     * 用【常驻缓冲】而不是每帧 malloc。
+     *
+     * 【2026-11-05】原来是 heap_caps_malloc(buf_len, MALLOC_CAP_DMA|INTERNAL),
+     * 画完再 free。内部 RAM 紧张时这个申请会失败, 于是 lcd_fill_rect
+     * 直接返回 ESP_ERR_NO_MEM, 屏幕上该区域永远是黑的。
+     *
+     * 常驻缓冲在 lcd_init() 里一次性分配, 占用固定可预算;
+     * 这里假设 w <= LCD_WIDTH (调用方都满足), 所以缓冲一定够用。
+     */
+    if (!s_lcd_buf_ready) {
         return ESP_ERR_NO_MEM;
     }
+    size_t need = (size_t)w * LCD_BATCH_LINES * sizeof(uint16_t);
+    if (need > LCD_BUF_BYTES) {
+        ESP_LOGE(TAG, "fill_rect 宽度 %d 超出常驻缓冲容量", w);
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint16_t *buf = s_lcd_bufs[0];
 
     esp_err_t err = ESP_OK;
     int pending = 0;   /* 已发出但还没收到回调的批次数 */
@@ -262,13 +438,12 @@ esp_err_t lcd_fill_rect(int x, int y, int w, int h, uint16_t color)
         }
     }
 
-    /* 最后一批也要等传完才能 free(buf) */
+    /* 最后一批也要等传完才能复用 buf */
     while (pending > 0) {
         xSemaphoreTake(s_lcd_dma_done, portMAX_DELAY);
         pending--;
     }
     xSemaphoreGive(s_lcd_mutex);
-    free(buf);
     return err;
 }
 
@@ -278,7 +453,7 @@ esp_err_t lcd_fill_screen(uint16_t color)
 }
 
 esp_err_t lcd_draw_rgb565(const void *src, int src_stride, int x, int y, int w, int h,
-                           bool swap_bytes)
+                           bool swap_bytes, bool yield_between_batches)
 {
     if (s_panel == NULL) {
         return ESP_ERR_INVALID_STATE;
@@ -298,27 +473,67 @@ esp_err_t lcd_draw_rgb565(const void *src, int src_stride, int x, int y, int w, 
      * SPI 的 DMA 缓冲要在内部 RAM，而图像源在 PSRAM，
      * 所以逐批拷贝到内部缓冲再发送。
      * 注意: 图像源可能带行距 (stride)，不能直接整块 memcpy。
+     *
+     * ---------------------------------------------------------------------------
+     * 【双缓冲】用两个缓冲交替, 而不是一块缓冲复用。
+     *
+     * 为什么必须双缓冲 (而不是靠信号量等上一批传完):
+     *
+     *   esp_lcd_panel_draw_bitmap() 内部做的事是:
+     *     1) tx_param(CASET)  <- 里面会等队列里的事务传完
+     *     2) tx_param(RASET)  <- 同上
+     *     3) tx_color(RAMWR) <- 把 buf 丢进队列, 立刻返回 (DMA 后台在读它)
+     *
+     *   第 3 步是【异步】的: 函数返回时 DMA 还在读 buf。
+     *   我们下一轮循环要往 buf 里写新的一批 —— 如果此时上一批还没传完,
+     *   我们就把正在被 DMA 读取的内存覆盖了, 面板收到的是新旧混合数据,
+     *   画面就变成一条条横条 / 花屏。
+     *
+     *   信号量能解决"等上一批传完", 但它在 ISR 里 give, 存在时序窗口:
+     *   ISR 给出信号 -> 我们被唤醒 -> 但 DMA 可能还没完全结束。
+     *   双缓冲彻底消除这个窗口: 写缓冲 B 时, DMA 读的是缓冲 A, 物理上不可能撞。
+     *
+     * 代价: 多一块 6400 字节的内部 RAM (LCD_BATCH_LINES=10 时)。
+     *
+     * ---------------------------------------------------------------------------
+     * 【2026-11-05 修复黑屏】缓冲改成【模块级常驻】
+     *
+     * 原来是每帧 malloc 2 块 12800 字节的内部 DMA 缓冲, 画完 free。
+     * 开机实测内部 RAM 只剩 16983 字节 < 25600, 所以【每一帧都申请失败】,
+     * 屏幕从来没被成功画过一张 -> 全黑。
+     *
+     * 现在: 缓冲在 lcd_init() 里一次性分配, 常驻不释放。
+     * 占用固定 (2 x 6400 = 12800 字节), 不会因为某一帧内存紧张就整屏失败。
      */
-    size_t buf_len = (size_t)w * LCD_BATCH_LINES * sizeof(uint16_t);
-    uint16_t *buf = heap_caps_malloc(buf_len, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    if (buf == NULL) {
+    if (!s_lcd_buf_ready) {
+        /* 缓冲没就绪 -> 跳过这一帧, 不刷错误日志 (内存紧张是常态) */
         return ESP_ERR_NO_MEM;
     }
+    size_t need = (size_t)w * LCD_BATCH_LINES * sizeof(uint16_t);
+    if (need > LCD_BUF_BYTES) {
+        ESP_LOGE(TAG, "draw_rgb565 宽度 %d 超出常驻缓冲容量", w);
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint16_t *bufs[LCD_BUF_COUNT] = { s_lcd_bufs[0], s_lcd_bufs[1] };
 
     const uint8_t *src8 = (const uint8_t *)src;
     size_t row_bytes = (size_t)w * sizeof(uint16_t);
 
     esp_err_t err = ESP_OK;
     int pending = 0;   /* 已发出但还没收到回调的批次数 */
+    int cur = 0;       /* 当前正在写的缓冲下标 */
+    int yield_counter = 0;  /* 让出 CPU 的计数器 */
 
     xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
     for (int row = 0; row < h && err == ESP_OK; row += LCD_BATCH_LINES) {
         int lines = (h - row < LCD_BATCH_LINES) ? (h - row) : LCD_BATCH_LINES;
 
         /*
-         * 关键: 等上一批颜色数据真正传完, 再覆写 buf。
-         * SPI 颜色数据是异步 DMA 传输的, 不等就会把正在传的数据冲掉,
-         * 画面被切成一条一条的横条 (每条 40 行 = 一个批次)。
+         * 关键: 等上一批颜色数据真正传完, 再覆写缓冲。
+         * 双缓冲下, 我们写的是 cur, DMA 读的是上一批的 1-cur, 所以
+         * 即使不等也不会撞; 但这里仍然等一下, 保证不排队过多事务
+         * (SPI 事务队列深度有限, 而且排队会延迟显示)。
+         *
          * take 一次 = 消耗一次 give, 收支平衡, 不会死锁。
          */
         if (pending > 0) {
@@ -326,6 +541,7 @@ esp_err_t lcd_draw_rgb565(const void *src, int src_stride, int x, int y, int w, 
             pending--;
         }
 
+        uint16_t *buf = bufs[cur];
         for (int l = 0; l < lines; l++) {
             const uint8_t *srow = src8 + (size_t)(row + l) * src_stride;
             uint16_t *drow = &buf[(size_t)l * w];
@@ -339,23 +555,49 @@ esp_err_t lcd_draw_rgb565(const void *src, int src_stride, int x, int y, int w, 
                 memcpy(drow, srow, row_bytes);
             }
         }
-
         /* x_end / y_end 是【开区间】右边界 */
         err = esp_lcd_panel_draw_bitmap(s_panel, x, y + row, x + w, y + row + lines, buf);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "draw_rgb565 失败 @(%d,%d): %s", x, y + row, esp_err_to_name(err));
         } else {
             pending++;
+            cur ^= 1;   /* 下一批换到另一个缓冲 */
+        }
+
+        /*
+         * 让出 CPU 给摄像头的 DVP DMA。
+         *
+         * 摄像头的 DVP 数据是通过 GDMA 搬进 PSRAM 的, 而 PSRAM 总线共享。
+         * 如果画屏时长时间连续占用 PSRAM, DVP DMA 抢不到带宽 -> 丢行。
+         * 所以每画完几批就让出一次。
+         *
+         * 让出频率: 每 8 批 (80 行) 让一次。
+         *   之前是每批都让 (每批 10ms), 一帧要 120ms —— 太慢, 画面会有明显延迟感。
+         *   每 8 批让一次的话一帧只要 ~30ms, 既让出了总线, 又不拖慢刷新。
+         *
+         * 【2026-11-05】批量行数从 20 降到 10 (为了省内部 RAM) 后,
+         * 一帧的批次数从 12 变成 24。如果让出频率还是每 4 批,
+         * 一帧就要让出 6 次 x 10ms = 60ms —— 实测 lcd_draw_us 确实到了 58ms,
+         * 画面明显变卡。这里同步改成每 8 批, 让出次数减半, 又回到 ~30ms。
+         * 让出的【总行数】不变 (还是每 80 行让一次), 所以对 DVP DMA 的效果不变。
+         *
+         * vTaskDelay(1) = 1 tick = 10ms (tick 率 100Hz)。
+         * 注意不能用 pdMS_TO_TICKS(1) —— 那个在 100Hz 下算出来是 0, 等于没让。
+         */
+        if (yield_between_batches) {
+            if ((++yield_counter % 8) == 0) {
+                vTaskDelay(1);
+            }
         }
     }
 
-    /* 最后一批也要等传完才能 free(buf) */
+    /* 最后一批也要等传完才能复用 buf */
     while (pending > 0) {
         xSemaphoreTake(s_lcd_dma_done, portMAX_DELAY);
         pending--;
     }
     xSemaphoreGive(s_lcd_mutex);
-    free(buf);
+    /* 【2026-11-05】缓冲常驻, 不再 free */
     return err;
 }
 
@@ -470,7 +712,7 @@ esp_err_t lcd_draw_synthetic_image(bool swap_bytes)
     }
 
     esp_err_t err = lcd_draw_rgb565(img, LCD_H_RES * 2, 0, 0,
-                                    LCD_H_RES, LCD_V_RES, swap_bytes);
+                                    LCD_H_RES, LCD_V_RES, swap_bytes, true);
     free(img);
     return err;
 }
@@ -498,13 +740,13 @@ esp_err_t lcd_draw_frame_diagnostic(const void *src, int src_stride, int w, int 
 
     /* 上半屏: 画原始源 (PSRAM), 只画上面 120 行 */
     int half_h = h / 2;
-    esp_err_t err = lcd_draw_rgb565(src, src_stride, 0, 0, w, half_h, swap_bytes);
+    esp_err_t err = lcd_draw_rgb565(src, src_stride, 0, 0, w, half_h, swap_bytes, true);
     if (err != ESP_OK) {
         return err;
     }
 
     /* 下半屏: 画内部 RAM 副本 */
-    err = lcd_draw_rgb565(copy_buf, w * 2, 0, half_h, w, h - half_h, swap_bytes);
+    err = lcd_draw_rgb565(copy_buf, w * 2, 0, half_h, w, h - half_h, swap_bytes, true);
     return err;
 }
 
@@ -535,8 +777,6 @@ esp_err_t lcd_draw_quad_diagnostic(const void *src, int src_stride, int w, int h
         return ESP_ERR_INVALID_ARG;
     }
 
-    const uint8_t *src8 = (const uint8_t *)src;
-
     const int qw = w / 2;
     const int qh = h / 2;
 
@@ -559,26 +799,26 @@ esp_err_t lcd_draw_quad_diagnostic(const void *src, int src_stride, int w, int h
     const uint8_t *s8 = (const uint8_t *)src;
 
     /* Q1: 源 (0,0) 160x120 */
-    esp_err_t err = lcd_draw_rgb565(s8, src_stride, 0, 0, qw, qh, swap_bytes);
+    esp_err_t err = lcd_draw_rgb565(s8, src_stride, 0, 0, qw, qh, swap_bytes, true);
     if (err != ESP_OK) {
         return err;
     }
 
     /* Q2: 源 (160,0) 160x120 */
-    err = lcd_draw_rgb565(s8 + (size_t)qw * 2, src_stride, qw, 0, w - qw, qh, swap_bytes);
+    err = lcd_draw_rgb565(s8 + (size_t)qw * 2, src_stride, qw, 0, w - qw, qh, swap_bytes, true);
     if (err != ESP_OK) {
         return err;
     }
 
     /* Q3: 源 (0,120) 160x120 */
-    err = lcd_draw_rgb565(s8 + (size_t)qh * src_stride, src_stride, 0, qh, qw, h - qh, swap_bytes);
+    err = lcd_draw_rgb565(s8 + (size_t)qh * src_stride, src_stride, 0, qh, qw, h - qh, swap_bytes, true);
     if (err != ESP_OK) {
         return err;
     }
 
     /* Q4: 源 (160,120) 160x120 */
     err = lcd_draw_rgb565(s8 + (size_t)qh * src_stride + (size_t)qw * 2, src_stride,
-                          qw, qh, w - qw, h - qh, swap_bytes);
+                          qw, qh, w - qw, h - qh, swap_bytes, true);
     if (err != ESP_OK) {
         return err;
     }

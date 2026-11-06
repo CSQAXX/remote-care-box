@@ -18,6 +18,9 @@
 #ifndef CAMERA_PINS_H
 #define CAMERA_PINS_H
 
+/* BOARD_I2C_PORT 用到 i2c_port_t / I2C_NUM_0, 需要 driver/i2c.h */
+#include "driver/i2c.h"
+
 /* ---- 摄像头 DVP 数据线 (GC0308) ---- */
 #define CAM_PIN_D0     7    /* GPIO_NUM_7  */
 #define CAM_PIN_D1     8    /* GPIO_NUM_8  */
@@ -57,6 +60,40 @@
 #define LCD_CS_PIN        47
 #define LCD_WIDTH         320
 #define LCD_HEIGHT        240
+
+/* ---- 板载音频 codec (正点原子 BOX3 官方 board config) ----
+ *
+ * 重要更正: 之前文档里写的 "ES8388" 是错的, 那是裸板 DNESP32S3 的方案。
+ * BOX3 实际用的是 ES8311 (DAC/ADC codec) + ES7210 (双麦克风 ADC),
+ * 引脚也完全不同 —— 照抄裸板的 ES8388 引脚 (GPIO46/9/10/14/3) 会和
+ * 摄像头数据线 (GPIO9/10/46) 直接撞车, 屏幕会花。
+ *
+ *   MCLK  = 21
+ *   WS    = 39
+ *   BCLK  = 38
+ *   DIN   = 41   (codec -> MCU, 录音数据)
+ *   DOUT  = 40   (MCU -> codec, 播放数据)
+ *   I2C   = SDA 3 / SCL 2  (与摄像头 SCCB、AW9523B 共用)
+ */
+#define AUDIO_I2S_MCLK_PIN   21
+#define AUDIO_I2S_WS_PIN     39
+#define AUDIO_I2S_BCLK_PIN   38
+#define AUDIO_I2S_DIN_PIN    41   /* codec 输出 (ADC 录音) */
+#define AUDIO_I2S_DOUT_PIN   40   /* codec 输入 (DAC 播放) */
+#define AUDIO_SAMPLE_RATE    16000 /* 语音对讲用 16k (G.711 场景) */
+
+/* ES8311 / ES7210 的 I2C 地址
+ *
+ * 注意: esp_codec_dev 要求传 **8 位地址** (带 R/W 位的形式),
+ * 它内部会自己 >>1 转成 7 位。所以这里必须是 0x30 / 0x80, 不是 0x18/0x40。
+ * 组件头文件里的默认值 ES8311_CODEC_DEFAULT_ADDR=0x30 /
+ * ES7210_CODEC_DEFAULT_ADDR=0x80 就是 8 位形式。
+ *
+ * I2C 扫描实测 (7 位): 0x18 = ES8311, 0x40 = ES7210 —— 与上面一致。
+ */
+#define ES8311_I2C_ADDR      0x30    /* 8 位地址 (7 位 = 0x18) */
+#define ES7210_I2C_ADDR      0x80    /* 8 位地址 (7 位 = 0x40) */
+#define ES8388_I2C_ADDR      0x22    /* 裸板方案, 仅用于扫描时对照 */
 
 /* ---- 摄像头 SCCB 地址 (7 位) ---- */
 #define CAM_SCCB_ADDR       0x21    /* GC0308 */
@@ -106,13 +143,73 @@
  *
  * 当前默认 STA 模式 —— 电脑不用切网络, 直接访问板子 IP 就能看画面。
  * (产品最终也是这个架构: 设备主动连服务器, 电脑/小程序只是客户端)
+ *
+ * ---------------------------------------------------------------------------
+ * 重要: 同一个 SSID 的 2.4GHz 和 5GHz 可能是完全不同的认证方式
+ *
+ * 实测 (板子自己扫的结果, 串口命令 "scan"):
+ *   [ 0] eduroam      ch11  -56 dBm  WPA2-ENT   <- 最强, 但是企业认证
+ *   [ 1] WMU-EDU      ch11  -70 dBm  OPEN      <- 2.4GHz, 无密码!
+ *   [ 2] 7D302-1      ch11  -70 dBm  WPA2
+ *   [ 4] WMU-EDU      ch13  -71 dBm  OPEN
+ *   [ 5] WMU-GUEST    ch13  -71 dBm  OPEN
+ *   [ 8] Tenda_A9B050 ch3   -78 dBm  WPA2
+ *   [ 9] TP-7D304     ch11  -80 dBm  WPA2
+ *   [11] NYR          ch12  -92 dBm  WPA2
+ *
+ * 而电脑 (Intel BE200) 扫到的 WMU-EDU 是 5GHz 信道 52, 无密码 ——
+ * 说明路由器把 2.4G 和 5G 分成了两套 BSSID, 而且认证方式也不同。
+ *
+ * ESP32-S3 只支持 2.4GHz, 所以板子必须连 ch11 那个 OPEN 的 WMU-EDU。
+ * 之前连不上的真正原因: 密码写错了 (对 OPEN 网络, 密码必须为空,
+ * 填了反而连不上) + ESP32 在 5GHz 上疯狂重连打爆 GDMA 导致花屏。
  */
 #define WIFI_MODE_AP        0     /* 1=板子开热点, 0=板子连路由器 */
 
-#define WIFI_SSID           "WMU-EDU"
-#define WIFI_PASSWORD       "Woaini11"
+/*
+ * Wi-Fi 配置 (家里)
+ *
+ * 重要: SSID 填错 = 板子永远连不上 = 疯狂重连 = 抢占 GDMA 总线
+ *       -> 摄像头 DMA 抢不到带宽 -> 丢行 -> 屏幕闪花屏。
+ *       所以换网络一定要同步改这里。
+ */
+#define WIFI_SSID           "501"
+
+#define WIFI_PASSWORD       "88378389"
 
 /* ---- 按键触发时网页弹出的提示语：改这一行就能换文案 ---- */
 #define BUTTON_MESSAGE      "老人按了求助按钮"
+
+/* ---- 长按撤销求助 (需求文档 §3.8) ----
+ *
+ * §3.8: 求助短按 -> 屏幕显示「已通知家人」, 10s 内可长按撤销。
+ * 这里定义:
+ *   - 撤销文案 (上报给云端, 让后台关闭告警)
+ *   - 长按判定时长 (按住多久算长按)
+ */
+#define HELP_CANCEL_MESSAGE "老人取消了求助"
+#define LONGPRESS_CANCEL_MS 3000
+
+/* ---- 屏幕提示相关 ---- */
+
+/* 屏幕提示任务栈 (内部 RAM, 4096 字节足够) */
+#define LCD_PROMPT_STACK_SIZE 4096
+
+/* ---- 电脑端接收服务 (M2.6 TCP 主动推送) ----
+ *
+ * 事件推送方向: 板子 -> 电脑。板子当 TCP 客户端, 电脑当服务端。
+ * 接收脚本在 pc_receiver/recv_event.py。
+ *
+ * 端口为什么用 5556 而不是文档里写的 5555:
+ *   本机 5555 已被 Android 模拟器的 qemu-system-x86_64 占着
+ *   (实测 PID 6624 监听 ::1:5555 和 127.0.0.1:5555),
+ *   绑不上会直接 connect 失败。5556 是空闲的。
+ *   真要用 5555, 先关掉模拟器, 再把下面这行改回去。
+ *
+ * 换电脑/换网络时要同步改这两行。
+ * 板子自己的 IP 每次 DHCP 都可能变, 改完重新烧录即可。
+ */
+#define PC_RECEIVER_IP        "192.168.2.135"
+#define PC_RECEIVER_PORT      5556
 
 #endif /* CAMERA_PINS_H */

@@ -47,6 +47,18 @@
 
 #include "nvs_flash.h"
 #include "driver/gpio.h"
+
+/*
+ * HAL 层的 I2C 低层接口。
+ *
+ * 需要它是因为 IDF 提供了两个精确解决"总线卡死"的硬件功能:
+ *   i2c_ll_master_fsm_rst()  —— 复位卡在等 ACK 的主控状态机
+ *   i2c_ll_master_clr_bus()  —— 硬件自动打时钟脉冲, 直到从机释放 SDA
+ * 这两个是 ESP32-S3 的 I2C 外设原生能力, 比用 GPIO 手动打脉冲可靠得多
+ * (GPIO 手动打脉冲的前提是引脚没被外设的 GPIO matrix 接管, 而实际做不到)。
+ */
+#include "hal/i2c_ll.h"
+#include "soc/soc_caps.h"
 #include "driver/i2c.h"
 #include "driver/usb_serial_jtag.h"
 
@@ -57,6 +69,11 @@
 #include "lcd_st7789.h"
 #include "audio_board.h"
 #include "g711.h"
+#include "activity_detect.h"
+#include "time_sync.h"
+#include "lcd_prompt.h"
+#include "push_client.h"
+#include "reliability.h"
 
 #include <math.h>
 
@@ -232,13 +249,17 @@ static frame_slot_t   s_jpg_slots[SLOT_COUNT];
 static SemaphoreHandle_t s_slot_mutex = NULL;
 
 /*
- * 四象限诊断用的内部 RAM 副本缓冲 (160x120x2 = 38400 字节)。
- * 必须放内部 RAM: 诊断的目的就是对比 "PSRAM 源" 和 "内部 RAM 副本",
- * 如果副本也在 PSRAM 就失去对比意义了。
+ * 【已删除】四象限诊断用的内部 RAM 副本缓冲 (160x120x2 = 38400 字节)。
+ *
+ * 这个缓冲 2026-11-05 被删掉了, 原因:
+ *   1. 它【从来没被用过】—— 全代码里只有分配语句, 没有任何读写。
+ *   2. 它白白占掉 38400 字节内部 RAM, 而内部 RAM 在这块板子上极其紧张:
+ *      开机实测只剩 16983 字节, 结果 LCD 双缓冲 (需要 25600 字节)
+ *      申请失败 -> 每帧画屏都失败 -> 【屏幕全黑】。
+ *
+ * 教训: 板子上"看起来不起眼"的常驻缓冲, 每一个都会挤掉别人的内存。
+ * 内部 RAM 的分配必须按"开机实测剩余量"倒推, 而不是凭感觉。
  */
-#define DIAG_W 160
-#define DIAG_H 120
-static uint8_t *s_diag_copy_buf = NULL;
 
 /* 统计信息 (给 /health 看) */
 static volatile uint32_t s_cam_frames = 0;      /* 摄像头取帧数 */
@@ -973,7 +994,33 @@ typedef enum {
 
 static volatile lcd_mode_t s_lcd_mode = LCD_MODE_CAMERA;
 
-/* 噪点行统计开关 (排障用) */
+/*
+ * ---------------- 屏幕提示的显示所有权 (需求文档 §3.8) ----------------
+ *
+ * 背景:
+ *   屏幕提示 (lcd_prompt.c) 要在摄像头画面【上面】叠一条横幅。
+ *   如果摄像头直绘继续跑, 下一帧就把横幅盖掉了, 提示等于没显示。
+ *
+ * 做法:
+ *   提示任务画横幅前调 lcd_view_pause() -> 生产者暂停往屏幕直绘。
+ *   提示到期后调 lcd_view_resume() -> 生产者恢复直绘,
+ *   下一帧画面自然把横幅区域覆盖回来 (不用我们重画背景)。
+ *
+ * 为什么不用互斥锁:
+ *   生产者和提示任务都要往屏幕写, 如果用锁, 提示要等当前那一帧画完
+ *   (最长 40ms) 才能拿到锁 —— 能接受, 但更麻烦的是"暂停"期间
+ *   生产者要不要一直持锁? 持着的话提示就永远拿不到。
+ *   所以这里用一个【标志位 + 等待】的组合:
+ *     - 标志位是 volatile bool, 生产者每帧检查
+ *     - 提示任务设置标志后等一小会儿, 让生产者完成当前帧
+ *
+ * 【关键】提示期间画面是【静止的旧画面 + 横幅】, 不是撕裂。
+ *   因为生产者是整帧画完的, 暂停只发生在帧边界。
+ */
+static volatile bool     s_lcd_view_paused = false;
+static volatile uint32_t s_lcd_pause_count = 0;   /* 暂停次数 (调试用) */
+
+/* ---------------- 噪点行统计开关 (排障用) ---------------- */
 static volatile bool s_noise_enabled = false;
 
 #define WIFI_CONNECTED_BIT BIT0
@@ -1123,6 +1170,17 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "已连接 Wi-Fi，内网 IP: " IPSTR, IP2STR(&event->ip_info.ip));
         xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
+
+        /*
+         * 一连上网就立刻对时。
+         *
+         * 设备没有 RTC, 开机后的系统时间是编译时刻。
+         * 活动检测的 last_active_ts、告警时间戳、夜间规则全都依赖真实时间,
+         * 所以这里必须第一时间校时 (需求文档 §3.9)。
+         *
+         * 对时失败不影响主流程 —— time_sync 任务会自己重试。
+         */
+        time_sync_start();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_START) {
         ESP_LOGI(TAG, "热点已启动，SSID: %s", WIFI_SSID);
         xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
@@ -1285,7 +1343,7 @@ static void board_i2c_init(void)
  */
 #define AUDIO_I2C_SCAN_ENABLE  0
 
-static void __attribute__((unused)) i2c_scan_audio(void)
+static void i2c_scan_audio(void)
 {
     ESP_LOGI(TAG, "==== I2C 总线扫描 (找音频 codec) ====");
     uint8_t reg = 0x00;
@@ -1307,11 +1365,428 @@ static void __attribute__((unused)) i2c_scan_audio(void)
     ESP_LOGI(TAG, "==== 扫描结束 ====");
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * 【2026-11-05 修复"屏幕无画面"】I2C 总线恢复 (bus recovery)
+ * ---------------------------------------------------------------------------
+ *
+ * 症状:
+ *   开机后 AW9523B / SCCB / codec 全部 ESP_ERR_TIMEOUT,
+ *   重试 10 次 (3.9s) 也没用, 但运行到 20 秒后手动读就能通。
+ *
+ * 根因: I2C 总线被某个器件"钳死"了。
+ *   I2C0 (SDA=3/SCL=2) 上挂了 4 个器件:
+ *     AW9523B(0x59) / GC0308(0x21) / ES8311(0x18) / ES7210(0x40)
+ *   其中有器件在【还没被正确复位】时会一直把 SDA 或 SCL 按住不放
+ *   (典型是 NXP 系列的 "SDA 拉低等待 ACK" 状态)。
+ *   一旦有一个器件按住 SDA, 主机发什么都收不到 ACK —— 全部超时。
+ *
+ *   为什么 20 秒后会自己好:
+ *     ES8311/ES7210 的初始化过程里会做软件复位, 顺带把总线释放了。
+ *     所以真正起作用的不是"等", 而是 codec 初始化时对总线的干预。
+ *
+ * 标准的解法是【总线恢复序列】(I2C 规范 3.1.16):
+ *   1. 把 SDA/SCL 配成【开漏输入】
+ *   2. 手动拉高 SCL, 然后检查 SDA 是否已经释放
+ *   3. 如果 SDA 还是低 -> 主控模拟主机, 手动打 9 个 SCL 脉冲
+ *      (每个器件最多会释放一个 ACK 位), 让挂住的器件把 SDA 放掉
+ *   4. 再补一个 STOP 条件 (SDA 从低到高, 此时 SCL 为高)
+ *   5. 恢复 SDA/SCL 为正常的开漏 + 上拉, 交给驱动
+ *
+ * 这就是"救砖"标准做法, 对所有"总线被钳死"的场景都有效。
+ * ---------------------------------------------------------------------------
+ */
+
+/*
+ * ---------------------------------------------------------------------------
+ * 【2026-11-05】I2C 全地址扫描 —— 一次性看清总线上到底谁在应答
+ * ---------------------------------------------------------------------------
+ *
+ * 背景:
+ *   开机时 AW9523B / SCCB 全部超时, 但运行到 ~20 秒后又能读到。
+ *   光看"超时"不知道是"总线被钳死"、"地址错了"还是"器件没上电"。
+ *
+ *   全地址扫描能一次给出全部答案:
+ *     - 有地址应答         -> 总线是好的, 问题在具体器件或地址
+ *     - 一个都不应答且
+ *       SDA/SCL 都是 0     -> 总线被钳死 (需要 bus recovery)
+ *     - 一个都不应答但
+ *       SDA/SCL 都是 1     -> 总线空闲, 但所有器件都没上电
+ */
+static void i2c_scan_once(void)
+{
+    int sda = gpio_get_level(BOARD_I2C_SDA_PIN);
+    int scl = gpio_get_level(BOARD_I2C_SCL_PIN);
+
+    ESP_LOGI(TAG, "==== I2C 总线扫描 ====");
+    ESP_LOGI(TAG, "  初始电平: SDA=%d SCL=%d", sda, scl);
+
+    uint8_t reg = 0x00;
+    uint8_t val = 0;
+    int found = 0;
+    for (int addr = 0x08; addr <= 0x77; addr++) {
+        esp_err_t err = i2c_master_write_read_device(BOARD_I2C_PORT, addr,
+                                                     &reg, 1, &val, 1,
+                                                     pdMS_TO_TICKS(20));
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "  0x%02X 应答 (reg0x00=0x%02X)", addr, val);
+            found++;
+        }
+    }
+    ESP_LOGI(TAG, "  共 %d 个地址应答", found);
+    ESP_LOGI(TAG, "==== 扫描结束 ====");
+}
+
+/*
+ * 总线监视任务: 每 2 秒做一次全地址扫描, 连续记录 30 秒。
+ * 用来确定"总线到底什么时候恢复"以及"恢复时哪些器件一起上线"。
+ */
+static void i2c_monitor_task(void *arg)
+{
+    for (int round = 1; round <= 15; round++) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        i2c_scan_once();
+    }
+    vTaskDelete(NULL);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * 【2026-11-05 修复"屏幕无画面"】I2C 总线恢复 (bus recovery)
+ * ---------------------------------------------------------------------------
+ *
+ * 症状:
+ *   开机后 AW9523B / SCCB / codec 全部 ESP_ERR_TIMEOUT,
+ *   但运行到 20 秒后手动读就能通 (0x18/0x19/0x40/0x59 四个地址都应答)。
+ *
+ * 【一个必须避开的诊断陷阱】
+ *   gpio_get_level() 只有在引脚是【纯输入】时才读引脚真实电平;
+ *   一旦配成 GPIO_MODE_INPUT_OUTPUT_OD (输出使能), 它读的是
+ *   GPIO.out_reg —— 也就是"我们/外设请求输出的值", 不是引脚上的电平。
+ *
+ *   I2C 外设接管引脚后, out_reg 会被外设的状态机写入。
+ *   如果外设卡在一个未完成的事务里 (对端不应答, 主机一直等 ACK),
+ *   out_reg 就会停在 SDA=0/SCL=0 —— 这正是我们最初看到的现象。
+ *   所以"读出来是 0"根本不能证明引脚被物理拉低, 之前的判断是错的。
+ *
+ *   正确测法: 先把引脚切成 GPIO_MODE_INPUT (纯输入, 输出关闭),
+ *   此时 gpio_get_level() 走 in_reg, 读到的才是真实电平。
+ *
+ * 恢复序列 (I2C 规范 3.1.16 的 bus recovery):
+ *   1. 卸载 I2C 驱动 —— 顺带复位外设状态机 (卡在等 ACK 的事务会解开)
+ *   2. 用纯输入模式读一次真实电平, 判断到底是被拉低还是外设假象
+ *   3. 切到开漏模式, 手动打大量 SCL 脉冲
+ *      (每个挂在总线上的器件最多释放一个 ACK 位)
+ *   4. 补一个 STOP 条件 (SCL 为高时 SDA 从低到高)
+ *   5. 再用纯输入模式确认电平是否已释放
+ *   6. 把 I2C 驱动装回去
+ * ---------------------------------------------------------------------------
+ */
+
+/*
+ * 把 SDA/SCL 临时切成纯输入, 读取引脚【真实】电平。
+ * 注意: 调用前必须先卸载 I2C 驱动, 否则外设还在驱动引脚。
+ */
+static void board_i2c_real_levels(int *sda_out, int *scl_out)
+{
+    const int scl_pin = BOARD_I2C_SCL_PIN;
+    const int sda_pin = BOARD_I2C_SDA_PIN;
+
+    gpio_config_t in_conf = {
+        .pin_bit_mask = (1ULL << scl_pin) | (1ULL << sda_pin),
+        .mode         = GPIO_MODE_INPUT,          /* 纯输入 -> 读 in_reg = 真实电平 */
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&in_conf));
+    vTaskDelay(pdMS_TO_TICKS(5));
+
+    if (sda_out) *sda_out = gpio_get_level(sda_pin);
+    if (scl_out) *scl_out = gpio_get_level(scl_pin);
+
+    /*
+     * 【必须还原】刚才把引脚切成了纯输入, 这等于把引脚从 I2C 外设上摘下来。
+     * 如果不还原, 后续的 I2C 事务根本发不出去 (引脚不再连到外设)。
+     *
+     * i2c_param_config() 内部会调 i2c_set_pin(), 把引脚重新接回 I2C 外设。
+     */
+    i2c_config_t restore = {
+        .mode                = I2C_MODE_MASTER,
+        .sda_io_num         = BOARD_I2C_SDA_PIN,
+        .scl_io_num         = BOARD_I2C_SCL_PIN,
+        .sda_pullup_en      = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en      = GPIO_PULLUP_ENABLE,
+        .master.clk_speed    = BOARD_I2C_FREQ_HZ,
+    };
+    i2c_param_config(BOARD_I2C_PORT, &restore);
+    vTaskDelay(pdMS_TO_TICKS(5));
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * 【2026-11-05】I2C 引脚物理状态探针 (开机最早期)
+ * ---------------------------------------------------------------------------
+ *
+ * 目的: 在任何 I2C 驱动/外设碰过这两个引脚之前, 搞清楚 SDA/SCL
+ *       在【物理层面】到底是什么状态。
+ *
+ * 用 4 种 GPIO 配置分别读, 交叉验证:
+ *   (a) INPUT + 内部上拉   -> 有外部上拉时读 1; 无外部上拉时靠内部上拉也能读 1
+ *   (b) INPUT 无上拉       -> 只有外部上拉才能读 1; 否则读 0 (悬空/被拉低)
+ *   (c) 推挽输出 1 后读回   -> 能读 1 说明线没被硬短
+ *   (d) 推挽输出 0 后读回   -> 能读 0 说明 MCU 真的能驱动这条线
+ *
+ * (a)(b) 的组合能区分"没有外部上拉"和"被拉低":
+ *   (a)=1 (b)=0  -> 只有内部上拉, 外部上拉缺失/太弱
+ *   (a)=0 (b)=0  -> 线被拉低 (有器件在钳死)
+ */
+static void i2c_pin_physical_probe(void)
+{
+    const int scl_pin = BOARD_I2C_SCL_PIN;
+    const int sda_pin = BOARD_I2C_SDA_PIN;
+
+    ESP_LOGW(TAG, "==== I2C 引脚物理探针 (SDA=%d SCL=%d) ====",
+             BOARD_I2C_SDA_PIN, BOARD_I2C_SCL_PIN);
+
+    /* (a) 纯输入 + 内部上拉 */
+    gpio_config_t c = {
+        .pin_bit_mask = (1ULL << scl_pin) | (1ULL << sda_pin),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&c);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    int a_sda = gpio_get_level(sda_pin), a_scl = gpio_get_level(scl_pin);
+
+    /* (b) 纯输入, 无上拉 */
+    c.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config(&c);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    int b_sda = gpio_get_level(sda_pin), b_scl = gpio_get_level(scl_pin);
+
+    /* (c) 推挽输出 1, 读回 */
+    c.mode = GPIO_MODE_OUTPUT;
+    c.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config(&c);
+    gpio_set_level(sda_pin, 1);
+    gpio_set_level(scl_pin, 1);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    int c_sda = gpio_get_level(sda_pin), c_scl = gpio_get_level(scl_pin);
+
+    /* (d) 推挽输出 0, 读回 */
+    gpio_set_level(sda_pin, 0);
+    gpio_set_level(scl_pin, 0);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    int d_sda = gpio_get_level(sda_pin), d_scl = gpio_get_level(scl_pin);
+
+    ESP_LOGW(TAG, "  (a) 输入+内部上拉 : SDA=%d SCL=%d", a_sda, a_scl);
+    ESP_LOGW(TAG, "  (b) 输入无上拉   : SDA=%d SCL=%d", b_sda, b_scl);
+    ESP_LOGW(TAG, "  (c) 推挽输出1读回: SDA=%d SCL=%d", c_sda, c_scl);
+    ESP_LOGW(TAG, "  (d) 推挽输出0读回: SDA=%d SCL=%d", d_sda, d_scl);
+
+    if (a_sda == 0 && b_sda == 0 && c_sda == 1) {
+        ESP_LOGE(TAG, "  => SDA 只能靠 MCU 推挽驱动才有高电平: 外部上拉缺失/失效");
+    } else if (a_sda == 0 && c_sda == 0) {
+        ESP_LOGE(TAG, "  => SDA 被硬短到地: 有器件/电路把它钳死了");
+    }
+    if (a_scl == 0 && b_scl == 0 && c_scl == 1) {
+        ESP_LOGE(TAG, "  => SCL 只能靠 MCU 推挽驱动才有高电平: 外部上拉缺失/失效");
+    } else if (a_scl == 0 && c_scl == 0) {
+        ESP_LOGE(TAG, "  => SCL 被硬短到地: 有器件/电路把它钳死了");
+    }
+
+    /* 还原成输入, 交给后面的 I2C 初始化 */
+    c.mode = GPIO_MODE_INPUT;
+    c.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&c);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * 【2026-11-05】I2C 多速率探测 —— 验证"上拉太弱"假说
+ * ---------------------------------------------------------------------------
+ *
+ * 假说: 板子上 SDA/SCL 没有像样的外部上拉电阻, 只靠 ESP32 内部上拉
+ *      (~45kΩ) 撑着。内部上拉在 100kHz 下 RC 上升沿太缓,
+ *      AW9523B 的 SCL 高电平建立时间要求达不到 -> 一直不应答。
+ *      而后面大量 SCCB 时钟脉冲 / codec 初始化改变了时序, 就通了。
+ *
+ * 验证方法: 依次用几个速度去读 AW9523B 的 ID 寄存器 (0x10),
+ *      哪个速度能读出来, 就说明是时序/上升沿问题。
+ *
+ * 只读 ID, 不写任何配置, 风险为零。
+ */
+static void i2c_speed_probe(void)
+{
+    static const uint32_t speeds[] = {100000, 50000, 20000, 10000, 5000};
+    uint8_t id = 0;
+
+    ESP_LOGW(TAG, "==== I2C 多速率探测 (目标 AW9523B 0x59, 寄存器 0x10) ====");
+
+    for (size_t i = 0; i < sizeof(speeds) / sizeof(speeds[0]); i++) {
+        i2c_config_t conf = {
+            .mode                = I2C_MODE_MASTER,
+            .sda_io_num         = BOARD_I2C_SDA_PIN,
+            .scl_io_num         = BOARD_I2C_SCL_PIN,
+            .sda_pullup_en      = GPIO_PULLUP_ENABLE,
+            .scl_pullup_en      = GPIO_PULLUP_ENABLE,
+            .master.clk_speed    = speeds[i],
+        };
+        esp_err_t err = i2c_param_config(BOARD_I2C_PORT, &conf);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "  %6lu Hz: param_config 失败 %s", (unsigned long)speeds[i], esp_err_to_name(err));
+            continue;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        id = 0;
+        err = i2c_master_write_read_device(BOARD_I2C_PORT, AW9523B_I2C_ADDR,
+                                           (uint8_t[]){AW9523B_REG_ID}, 1, &id, 1,
+                                           pdMS_TO_TICKS(200));
+        ESP_LOGW(TAG, "  %6lu Hz: %s (id=0x%02x)", (unsigned long)speeds[i],
+                 (err == ESP_OK) ? "应答" : esp_err_to_name(err), id);
+    }
+
+    /* 探测完把速度恢复成默认值 */
+    i2c_config_t conf = {
+        .mode                = I2C_MODE_MASTER,
+        .sda_io_num         = BOARD_I2C_SDA_PIN,
+        .scl_io_num         = BOARD_I2C_SCL_PIN,
+        .sda_pullup_en      = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en      = GPIO_PULLUP_ENABLE,
+        .master.clk_speed    = BOARD_I2C_FREQ_HZ,
+    };
+    i2c_param_config(BOARD_I2C_PORT, &conf);
+}
+
+/*
+ * 执行一次 I2C 总线恢复序列。
+ * 返回 true = 恢复后总线干净 (SDA/SCL 都是高), false = 仍被拉低。
+ */
+static bool board_i2c_bus_recover(void)
+{
+    const int scl_pin = BOARD_I2C_SCL_PIN;
+    const int sda_pin = BOARD_I2C_SDA_PIN;
+
+    /*
+     * 【为什么必须用 HAL 层, 不能用 GPIO 手动打脉冲】
+     *
+     * ESP32-S3 的 I2C 引脚通过 GPIO matrix 接到外设上。只要外设还在工作,
+     * 我们用 gpio_set_level() 写的值根本出不去 —— 实测打了 9 个和 200 个
+     * 脉冲, SDA/SCL 电平纹丝不动。
+     *
+     * 外设本身提供了原生的解法:
+     *   i2c_ll_master_fsm_rst()  复位卡在等 ACK 的主控状态机
+     *   i2c_ll_master_clr_bus()  让硬件自动发送时钟脉冲, 直到从机释放 SDA
+     *
+     * 【重要】绝对不能在这里 i2c_driver_delete()。
+     *   旧版驱动 (components/driver/i2c) 的对象是全局静态数组,
+     *   delete 之后 install 会失败 ("i2c driver install error"),
+     *   那样整条 I2C 就彻底废了 —— 之前踩过这个坑。
+     *   我们只操作外设寄存器, 不碰驱动生命周期。
+     */
+
+    /* 1) 复位卡死的主控状态机 */
+    i2c_ll_master_fsm_rst(I2C_LL_GET_HW(BOARD_I2C_PORT));
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    /* 2) 硬件清总线: 让硬件自动打脉冲, 直到从机释放 SDA */
+    i2c_ll_master_clr_bus(I2C_LL_GET_HW(BOARD_I2C_PORT), 9, true);
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    /*
+     * 3) 读真实电平。
+     *
+     * 【关键】读之前必须先把引脚从 I2C 外设上摘下来 (切成纯输入),
+     * 否则 gpio_get_level() 读的是 out_reg (我们请求输出的值),
+     * 不是引脚上的真实电平 —— 之前几次诊断就栽在这里。
+     *
+     * 读完再切回去 (board_i2c_real_levels 内部已经做了还原)。
+     */
+    int sda = 0, scl = 0;
+    board_i2c_real_levels(&sda, &scl);
+    ESP_LOGW(TAG, "I2C 真实电平[硬件清总线后]: SDA=%d SCL=%d%s",
+             sda, scl,
+             (sda == 0 || scl == 0) ? "  <== 仍被拉低" : "  (已释放)");
+
+    return (sda != 0 && scl != 0);
+}
+
 /* 板载电源使能 + 背光 + 摄像头复位 (走 AW9523B) */
+/*
+ * ---------------------------------------------------------------------------
+ * 【2026-11-05 修复"屏幕无画面"】AW9523B 开机瞬间不应答, 必须重试
+ * ---------------------------------------------------------------------------
+ *
+ * 症状:
+ *   开机日志:
+ *     W aw9523b: AW9523B 无应答 (addr=0x59): ESP_ERR_TIMEOUT
+ *     W kanhu:   AW9523B 不可用，跳过电源/背光/复位控制
+ *     W kanhu:   SCCB: 写 0xFE 失败: ESP_ERR_TIMEOUT
+ *     W kanhu:   SCCB: 读 PID 失败 (0x21): ESP_ERR_TIMEOUT
+ *     E camera:  Camera probe failed with error 0x106(ESP_ERR_NOT_SUPPORTED)
+ *   -> 屏幕永远黑, 浏览器也没有画面。
+ *
+ * 根因链:
+ *   AW9523B 是板载 IO 扩展器, 它管着:
+ *     XIO11 = 板载 3.3V 总电源使能
+ *     XIO14 = 摄像头 2.8V 供电使能
+ *     XIO15 = 摄像头复位
+ *     XIO8  = LCD 背光 (低电平点亮)
+ *   AW9523B 一旦不应答, camera_power_reset() 直接 return,
+ *   于是【摄像头的 2.8V 供电从未使能、复位从未给出】——
+ *   摄像头根本没电, SCCB 当然全超时, 画面当然出不来。
+ *
+ * 为什么开机瞬间 I2C 不通 (实测):
+ *   开机后 ~1.2s 时 AW9523B 无应答, 但到 ~2s 就正常了。
+ *   实测脚本 tools/i2c_probe.py: t=0.0s 无应答, t=2.0s 起 OK。
+ *   板子上 I2C0 (SDA=3/SCL=2) 上挂了 4 个器件:
+ *     AW9523B (0x59) / GC0308 (0x21) / ES8311 (0x18) / ES7210 (0x40)
+ *   刚上电时这些器件的电源轨 (特别是通过 AW9523B 供电的 2.8V 轨)
+ *   还没稳定, 会把总线拉死一段时间, 表现为所有地址都超时。
+ *
+ * 所以正确做法是【重试】而不是改引脚:
+ *   在 AW9523B 上最多重试 N 次, 每次间隔 300ms, 总预算 ~3s。
+ *   一旦应答成功, 立刻执行完整的电源/背光/复位时序。
+ *
+ * 【为什么不在这里直接 abort 重启】
+ *   重启解决不了问题 —— 每次重启都是同样的"上电瞬间总线未稳",
+ *   会变成无限重启循环。重试等待才是对症的。
+ * ---------------------------------------------------------------------------
+ */
+#define AW9523B_RETRY_MAX      20      /* 最多重试 20 次 */
+#define AW9523B_RETRY_GAP_MS   500     /* 每次间隔 500ms (总窗口 30s) */
+
 static void camera_power_reset(void)
 {
-    if (aw9523b_init(BOARD_I2C_PORT, AW9523B_I2C_ADDR) != ESP_OK) {
-        ESP_LOGW(TAG, "AW9523B 不可用，跳过电源/背光/复位控制");
+    bool aw_ok = false;
+
+    for (int attempt = 0; attempt < AW9523B_RETRY_MAX; attempt++) {
+        if (aw9523b_init(BOARD_I2C_PORT, AW9523B_I2C_ADDR) == ESP_OK) {
+            aw_ok = true;
+            break;
+        }
+        ESP_LOGW(TAG, "AW9523B 第 %d 次探测失败, %dms 后重试",
+                 attempt + 1, AW9523B_RETRY_GAP_MS);
+
+        /*
+         * 做一次 I2C 总线恢复。
+         *
+         * 恢复会卸载/重装 I2C 驱动, 所以只能在 app_main 早期做
+         * (此时还没有别的任务在用 I2C)。
+         */
+        board_i2c_bus_recover();
+
+        vTaskDelay(pdMS_TO_TICKS(AW9523B_RETRY_GAP_MS));
+    }
+
+    if (!aw_ok) {
+        ESP_LOGE(TAG, "AW9523B 重试 %d 次仍无应答 —— 摄像头供电/复位无法配置, 屏幕将无画面",
+                 AW9523B_RETRY_MAX);
+        ESP_LOGE(TAG, "  排查: 1)板子是否上电 2)I2C0 (SDA=3/SCL=2) 是否被拉死 3)AW9523B 是否虚焊");
         return;
     }
 
@@ -1729,9 +2204,32 @@ static void camera_init(void)
              s_sensor_mode == SENSOR_MODE_RAW_YUV422  ? "传感器直出 YUV422 (真值模式)" :
                                                        "GRAYSCALE (1字节/像素)");
 
-    esp_err_t err = esp_camera_init(&camera_config);
+    /*
+     * 摄像头初始化重试。
+     *
+     * 【为什么需要重试】上面的 camera_power_reset() 已经把 2.8V 供电
+     * 和复位时序做好了, 但 GC0308 从供电到能响应 SCCB 需要一小段时间
+     * (上电稳定 + 内部 PLL 锁定)。第一次 esp_camera_init() 失败很常见。
+     *
+     * 【为什么要 esp_camera_deinit】esp_camera_init() 失败时, 驱动内部
+     * 已经分配了一部分 DMA/帧缓冲。不 deinit 就重试, 第二次会因为
+     * 内存或资源残留再失败 —— 历史上就踩过"重复 init 导致 abort"。
+     */
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        err = esp_camera_init(&camera_config);
+        if (err == ESP_OK) {
+            if (attempt > 0) {
+                ESP_LOGI(TAG, "摄像头在第 %d 次尝试后初始化成功", attempt + 1);
+            }
+            break;
+        }
+        ESP_LOGW(TAG, "摄像头初始化失败 (第 %d 次): %s", attempt + 1, esp_err_to_name(err));
+        esp_camera_deinit();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "摄像头初始化失败: 0x%x", err);
+        ESP_LOGE(TAG, "摄像头初始化最终失败: %s", esp_err_to_name(err));
         ESP_LOGE(TAG, "  排查: 1)PSRAM Octal 2)SCCB 复用 I2C 是否已初始化 3)GC0308 供电/复位");
         return;
     }
@@ -2350,6 +2848,15 @@ static void camera_producer_task(void *arg)
     int64_t t0 = 0;
     int64_t last_rgb_copy_us = 0;   /* 上次拷 RGB 槽位的时间戳 */
     int64_t last_row_dump_us = 0;   /* 上次打亮度剖面的时间戳 */
+    int64_t last_snapshot_ms = 0;   /* 上次存 JPEG 环形缓存的时间戳 (§3.9) */
+
+    /*
+     * §3.9 看门狗: 订阅本任务。
+     *
+     * 必须在【本任务自己身上】调用 —— IDF 的 esp_task_wdt_add(NULL)
+     * 订阅的是调用它的那个任务。
+     */
+    reliability_watch_task(xTaskGetCurrentTaskHandle(), "cam_producer");
 
     while (true) {
         /*
@@ -2371,9 +2878,30 @@ static void camera_producer_task(void *arg)
 
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb == NULL) {
+            /*
+             * 【§3.9 摄像头失效检测】
+             *
+             * 取帧失败不一定是真失效 —— Wi-Fi 抢占总线时也会偶发失败。
+             * 所以连续失败到阈值才判定为失效, 并且失效后【继续重试】,
+             * 一旦成功就自动恢复正常。
+             *
+             * 为什么不直接 esp_camera_deinit():
+             *   之前 `conv 0` 命令直接 deinit, 而生产者正在 fb_get() 里,
+             *   两者并发直接 RTC_SW_CPU_RST 复位。而且传感器断电后
+             *   不一定能醒过来 —— 降级变成砖机比降级本身更糟。
+             *
+             * 降级期间保持音频和按键链路可用 (§3.9 明确要求):
+             *   老人出事时, 子女能听见、能被听见, 比有画面重要。
+             */
+            reliability_note_cam_failure();
+
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+
+        /* 取到帧了 —— 之前失败计数清零, 退出降级状态 */
+        reliability_note_cam_ok();
+
         s_cam_get_us = (uint32_t)(esp_timer_get_time() - t_start);
 
         /*
@@ -2506,6 +3034,20 @@ static void camera_producer_task(void *arg)
             s_r5_energy = cs.r5_energy;
             s_b5_energy = cs.b5_energy;
         }
+
+        /*
+         * ---- 活动检测 (需求文档 §3.5) ----
+         *
+         * 位置很讲究: 必须在【亮度稳定化】之前, 在【绿色修复】之前。
+         *
+         * 原因:
+         *   - 亮度稳定化会就地修改帧缓冲, 分析器看到的是被改过的画面
+         *   - 绿色修复同理
+         *   我们要分析的是【摄像头真正拍到的东西】, 不是处理后的结果
+         *
+         * 内部按 2fps 节流, 所以这里的调用开销可以忽略。
+         */
+        activity_detect_analyze((const uint8_t *)fb->buf, fb->width, fb->height);
 
         /*
          * 存一份原始帧快照 (取证用, 独立于噪点统计开关)。
@@ -2654,7 +3196,43 @@ static void camera_producer_task(void *arg)
             need_rgb = false;
         }
 
+        /*
+         * ---- 需要 JPEG 吗? ----
+         *
+         * 三种情况:
+         *   1. 有人在拉流 (s_stream_clients > 0) -> 必须编码
+         *   2. 推模式没连上 -> 隔一会儿编码一帧存进 JPEG 环形缓存,
+         *      这样断网期间还有个现场, 连上后可以补传 (§3.9 要求存 10 帧)
+         *   3. 【2026-11-05 新增】推模式连上了 -> 也要限速编码,
+         *      否则推任务没有帧可发, 电脑端就只能收到心跳收不到画面。
+         *
+         * 后两种情况必须【限速】。
+         * JPEG 编码很贵 (实测 320x240 @ q65 约 70ms, 占满 CPU),
+         * 每帧都编码会把帧率从 8fps 拖到 1fps 以下, 得不偿失。
+         * 断网缓存只需要"知道出事那会儿画面长什么样", 2 秒一帧足够了;
+         * 实时推送 1 秒一帧也够看 (人对 1fps 的静态画面不敏感,
+         * 而对讲/告警走的是事件流, 不依赖画面帧率)。
+         */
         bool need_jpg = (s_stream_clients > 0);
+
+        if (!need_jpg) {
+            int64_t since = now - last_snapshot_ms;
+            bool connected = push_client_is_connected();
+
+            if (connected) {
+                /* 已连接 -> 每 1 秒一帧, 实时推给电脑端 */
+                if (last_snapshot_ms == 0 || since >= 1000) {
+                    need_jpg = true;
+                    last_snapshot_ms = now;
+                }
+            } else {
+                /* 断网中 -> 每 2 秒存一帧, 留给补传 */
+                if (last_snapshot_ms == 0 || since >= 2000) {
+                    need_jpg = true;
+                    last_snapshot_ms = now;
+                }
+            }
+        }
 
         if (s_green_fix && (need_rgb || need_jpg)) {
             repair_green_low((uint8_t *)fb->buf, fb->width, fb->height);
@@ -2688,6 +3266,16 @@ static void camera_producer_task(void *arg)
          *   所以: 只有在 LCD_MODE_CAMERA 时才允许直绘。
          */
         if (need_rgb && s_lcd_direct_draw && s_lcd_mode == LCD_MODE_CAMERA) {
+            /*
+             * 屏幕提示期间暂停直绘 (需求文档 §3.8)。
+             *
+             * 不暂停的话, 提示刚画上去就被下一帧盖掉了。
+             * 暂停只发生在帧边界, 所以画面是"静止的旧画面 + 横幅",
+             * 不会撕裂。
+             */
+            if (s_lcd_view_paused) {
+                /* 让路给提示层, 不动屏幕 */
+            } else {
             int64_t t_draw = esp_timer_get_time();
             esp_err_t derr = lcd_draw_rgb565(fb->buf, fb->width * 2,
                                             0, 0, fb->width, fb->height, true, true);
@@ -2698,6 +3286,7 @@ static void camera_producer_task(void *arg)
                 s_lcd_direct_frames++;
             } else {
                 ESP_LOGW(TAG, "LCD 直绘失败: %s", esp_err_to_name(derr));
+            }
             }
         } else if (need_rgb && s_lcd_mode == LCD_MODE_CAMERA) {
             int rgb_idx = -1;
@@ -2749,6 +3338,22 @@ static void camera_producer_task(void *arg)
                     s_jpg_bytes = (uint32_t)jlen;
                     s_jpg_frames++;
                     slot_publish(s_jpg_slots, jpg_idx);
+
+                    /*
+                     * §3.9 断网缓存 + 实时推送: 把这帧交给推模式客户端。
+                     *
+                     * 【2026-11-05】推任务现在会【持续】从队列里取帧发出,
+                     * 所以这里每帧都要交进去 —— 不只是断网时。
+                     *
+                     * 之前只在 s_stream_clients == 0 时才存, 逻辑是
+                     * "没人拉流时才缓存, 留着断网后补传"。
+                     * 但推模式连着的时候这帧是要【实时】发给电脑端的,
+                     * 不交进去电脑端就只能收到心跳收不到画面。
+                     *
+                     * 有 HTTP 拉流客户端时也照样交 —— 两条链路是并行的,
+                     * 拉流走 httpd, 推流走 TCP push, 互不冲突。
+                     */
+                    push_client_push_jpeg(s_jpg_slots[jpg_idx].buf, jlen);
                 } else {
                     slot_release(s_jpg_slots, jpg_idx);
                 }
@@ -2800,7 +3405,70 @@ static void camera_producer_task(void *arg)
         if ((frames % 16) == 0) {
             vTaskDelay(APP_DELAY_TICKS);
         }
+
+        /*
+         * §3.9 看门狗: 生产者是唯一碰摄像头的任务。
+         *
+         * 它卡住 = 画面停住 = 子女以为老人出事了却看不到任何变化。
+         * 这个任务必须喂狗, 卡住就该复位。
+         */
+        reliability_feed_watchdog();
     }
+}
+
+/* ---------------- 屏幕提示的显示所有权 (需求文档 §3.8) ---------------- */
+
+/*
+ * 暂停摄像头直绘 —— 让屏幕提示层独占屏幕。
+ *
+ * lcd_prompt.c 在画横幅前调这个, 画完/到期后调 lcd_view_resume()。
+ *
+ * 【为什么用标志位而不是锁】
+ *   提示任务要画横幅, 生产者要画画面, 两者都要写 LCD。
+ *   如果用互斥锁:
+ *     - 提示任务要等生产者画完当前帧才能拿锁 (最长 40ms), 能接受
+ *     - 但提示【显示期间】(最长 10 秒) 生产者如果一直持锁, 提示就画不了
+ *   所以拆成两半:
+ *     - 标志位告诉生产者"别画了"
+ *     - 生产者在【帧边界】检查标志, 所以画面不会撕裂
+ *
+ * 【时序】
+ *   1. 提示任务置标志
+ *   2. 等 60ms —— 让生产者完成当前这一帧 (否则可能出现"半帧 + 横幅")
+ *   3. 提示任务画横幅
+ *   4. 到期 -> 清标志 -> 生产者下一帧自然覆盖回来
+ */
+void lcd_view_pause(void)
+{
+    if (s_lcd_view_paused) {
+        return;
+    }
+    s_lcd_view_paused = true;
+    s_lcd_pause_count++;
+
+    /*
+     * 等生产者让出屏幕。
+     *
+     * 60ms 是按"一帧直绘最长 ~40ms + 一点余量"估的。
+     * 等不到也没关系 —— 最多是横幅和画面重叠一小会儿,
+     * 不会崩, 只是可能有一帧的撕裂感。
+     */
+    vTaskDelay(pdMS_TO_TICKS(60));
+}
+
+/* 恢复摄像头直绘 */
+void lcd_view_resume(void)
+{
+    if (!s_lcd_view_paused) {
+        return;
+    }
+    s_lcd_view_paused = false;
+}
+
+/* 当前是否处于"提示独占屏幕"状态 (调试用) */
+bool lcd_view_is_paused(void)
+{
+    return s_lcd_view_paused;
 }
 
 /* ---------------- LCD 预览任务 (消费者) ---------------- */
@@ -3137,6 +3805,128 @@ static esp_err_t notify_handler(httpd_req_t *req)
 }
 
 /*
+ * POST /cmd —— 家人指令通道 (需求文档 §3.8)
+ *
+ * ============================ 为什么用 HTTP 先顶着 ============================
+ *
+ * §3.8 定义的下行指令是二进制帧 type=0x11:
+ *
+ *   | 家人正在看画面 | 收到 0x11 指令 | 屏幕显示「家人正在看画面」, 5s 后熄灭 |
+ *   | 家人正在呼叫   | 收到 0x11 指令 | 屏幕显示「家人正在呼叫您」, 伴随提示音 |
+ *   | 干预内容播放   | 收到 0x11 指令 | 屏幕显示「该活动一下」等文案 + 播放音频 |
+ *
+ * 但 M3 的 WSS 上云还没做, 现在没有可靠的二进制下行通道。
+ * 所以本期先用 HTTP POST 模拟, 语义和 0x11 完全一致,
+ * M3 上云后把这里的内容映射到 0x11 就行, 业务代码不用改。
+ *
+ * ============================ 请求格式 ============================
+ *
+ *   {"cmd":"watching"}                       -> 「家人正在看画面」
+ *   {"cmd":"calling"}                        -> 「家人正在呼叫您」+ 提示音
+ *   {"cmd":"content","text":"该活动一下"}      -> 自定义文案
+ *
+ * 也支持带时长的完整形式:
+ *   {"cmd":"watching","duration_ms":3000}
+ *
+ * ============================ 为什么"看画面"要能被设备知道 ============================
+ *
+ * 这是 §3.8 的核心 —— 防惊吓机制。
+ * 子女在小程序里点"看画面", 老人这边的屏幕必须亮出"家人正在看画面",
+ * 否则老人发现自己在被偷拍, 会恐慌, 会砸设备, 会拔电源。
+ *
+ * 所以这个端点不是"彩蛋", 是产品能不能用的前提。
+ */
+static esp_err_t cmd_handler(httpd_req_t *req)
+{
+    char buf[256];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        len = 0;
+    }
+    buf[len] = '\0';
+
+    /* 极简 JSON 解析: 找 "cmd" 和 "text" 字段 */
+    char cmd[32] = {0};
+    char text[128] = {0};
+    uint32_t duration_ms = 0;
+
+    const char *p = strstr(buf, "\"cmd\"");
+    if (p) {
+        p = strchr(p, ':');
+        if (p) {
+            p = strchr(p, '"');
+            if (p) {
+                p++;
+                size_t i = 0;
+                while (*p && *p != '"' && i < sizeof(cmd) - 1) {
+                    cmd[i++] = *p++;
+                }
+                cmd[i] = '\0';
+            }
+        }
+    }
+
+    p = strstr(buf, "\"text\"");
+    if (p) {
+        p = strchr(p, ':');
+        if (p) {
+            p = strchr(p, '"');
+            if (p) {
+                p++;
+                size_t i = 0;
+                while (*p && *p != '"' && i < sizeof(text) - 1) {
+                    text[i++] = *p++;
+                }
+                text[i] = '\0';
+            }
+        }
+    }
+
+    p = strstr(buf, "\"duration_ms\"");
+    if (p) {
+        p = strchr(p, ':');
+        if (p) {
+            duration_ms = (uint32_t)atoi(p + 1);
+        }
+    }
+
+    ESP_LOGI(TAG, "收到家人指令: cmd=%s text=%s duration=%" PRIu32,
+             cmd[0] ? cmd : "(空)", text[0] ? text : "(空)", (uint32_t)duration_ms);
+
+    if (strcmp(cmd, "watching") == 0) {
+        /* 家人正在看画面 —— 5s 后熄灭 */
+        lcd_prompt_show(PROMPT_WATCHING, NULL, duration_ms);
+        ESP_LOGI(TAG, "屏幕提示: 家人正在看画面");
+    } else if (strcmp(cmd, "calling") == 0) {
+        /* 家人正在呼叫 —— 伴随提示音 */
+        lcd_prompt_show(PROMPT_CALLING, NULL, duration_ms);
+        /*
+         * 提示音: 一次性「叮咚」, 不是循环测试音。
+         *
+         * 需求文档 §3.8 明确要求"伴随提示音"。用循环测试音的话会一直响,
+         * 老人听不出这是一次提示, 而且吓人的程度远超"防惊吓"的初衷。
+         */
+        audio_board_play_prompt_beep();
+        ESP_LOGI(TAG, "屏幕提示: 家人正在呼叫您 (伴随提示音)");
+    } else if (strcmp(cmd, "content") == 0) {
+        /* 干预内容播放 —— 自定义文案 */
+        lcd_prompt_show(PROMPT_CONTENT, text[0] ? text : NULL, duration_ms);
+        ESP_LOGI(TAG, "屏幕提示: 干预内容「%s」", text[0] ? text : "该活动一下");
+    } else {
+        httpd_resp_set_type(req, "application/json; charset=utf-8");
+        httpd_resp_send(req,
+                        "{\"ok\":false,\"error\":\"unknown cmd\","
+                        "\"supported\":[\"watching\",\"calling\",\"content\"]}",
+                        HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+/*
  * /raw —— 导出【原始 RGB565】帧 (取证用)。
  *
  * 为什么要这个端点:
@@ -3193,7 +3983,19 @@ static esp_err_t health_handler(httpd_req_t *req)
     esp_netif_ip_info_t ip;
     esp_netif_get_ip_info(s_netif, &ip);
 
-    char resp[512];
+    /*
+     * §3.9 推模式统计 + 可靠性状态。
+     *
+     * 放进 /health 是因为这是唯一不需要额外工具就能看到的地方 ——
+     * 排查"设备为什么没推事件"时, 先看这里。
+     */
+    push_stats_t ps;
+    push_client_get_stats(&ps);
+
+    heartbeat_t hb;
+    reliability_get_heartbeat(&hb);
+
+    char resp[768];
     snprintf(resp, sizeof(resp),
              "{\"ip\":\"" IPSTR "\",\"uptime\":%llu,\"frames\":%" PRIu32 ",\"clients\":%d,"
              "\"psram\":%" PRIu32 ","
@@ -3205,7 +4007,13 @@ static esp_err_t health_handler(httpd_req_t *req)
              "\"hi_energy\":%" PRIu32 ",\"lo_energy\":%" PRIu32 ","
              "\"hi_jumps\":%" PRIu32 ",\"lo_jumps\":%" PRIu32 ",\"bad_rows\":%" PRIu32 ","
              "\"jpeg_quality\":%d,\"max_fps\":%" PRIu32 ","
-             "\"audio_ready\":%s,\"audio_rate\":%d}",
+             "\"audio_ready\":%s,\"audio_rate\":%d,"
+             "\"time_synced\":%s,\"epoch_ms\":%lld,"
+             "\"rssi\":%d,\"free_heap\":%u,\"free_psram\":%u,"
+             "\"mode\":\"%s\",\"camera_ok\":%s,"
+             "\"push_connected\":%s,\"push_sent\":%u,\"push_jpegs\":%u,"
+             "\"push_replayed\":%u,\"push_dropped\":%u,\"push_queued\":%u,"
+             "\"push_fails\":%u,\"push_backoff_ms\":%u}",
              IP2STR(&ip.ip),
              (unsigned long long)(esp_timer_get_time() / 1000),
              (uint32_t)s_frame_count,
@@ -3231,7 +4039,51 @@ static esp_err_t health_handler(httpd_req_t *req)
              JPEG_QUALITY,
              (uint32_t)(s_jpg_encode_us > 0 ? 1000000 / s_jpg_encode_us : 0),
              audio_board_is_ready() ? "true" : "false",
-             AUDIO_SAMPLE_RATE);
+             AUDIO_SAMPLE_RATE,
+             time_sync_is_synced() ? "true" : "false",
+             (long long)time_sync_epoch_ms(),
+             /* §3.9 */
+             hb.rssi,
+             (unsigned)hb.free_heap,
+             (unsigned)hb.free_psram,
+             (reliability_get_mode() == RELIABILITY_MODE_DEGRADED) ? "degraded" : "normal",
+             hb.camera_ok ? "true" : "false",
+             ps.connected ? "true" : "false",
+             (unsigned)ps.sent_events,
+             (unsigned)ps.sent_jpegs,
+             (unsigned)ps.replayed,
+             (unsigned)ps.dropped,
+             (unsigned)ps.queued,
+             (unsigned)ps.connect_fails,
+             (unsigned)ps.backoff_ms);
+
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+/*
+ * GET /activity —— 活动检测当前状态 (需求文档 §3.5)
+ *
+ * 返回格式严格按文档:
+ *   { "event":"activity", "human_present":..., "motion":...,
+ *     "low_light":..., "motion_ratio":..., "score":...,
+ *     "last_active_ts":..., ... }
+ *
+ * 这个端点是【只读的事实快照】, 不做任何超时判断 ——
+ * 阈值判断属于后台规则引擎 (需求文档 §2.3 原则 1)。
+ */
+static esp_err_t activity_handler(httpd_req_t *req)
+{
+    char resp[512];
+
+    int n = activity_detect_to_json(resp, sizeof(resp));
+    if (n <= 0) {
+        httpd_resp_set_type(req, "application/json; charset=utf-8");
+        httpd_resp_send(req, "{\"error\":\"activity not initialized\"}",
+                        HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
 
     httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
@@ -3472,7 +4324,7 @@ static void http_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_PORT;
-    config.max_uri_handlers = 12;
+    config.max_uri_handlers = 16;
     config.stack_size = 10240;
     /*
      * 钉到 core 0 —— 和 cam_task / 其它任务同核。
@@ -3501,6 +4353,8 @@ static void http_server_start(void)
     httpd_uri_t audio_alaw = { .uri = "/audio/alaw", .method = HTTP_GET, .handler = audio_alaw_handler, .user_ctx = NULL };
     httpd_uri_t audio_down = { .uri = "/audio/down", .method = HTTP_POST, .handler = audio_down_handler, .user_ctx = NULL };
     httpd_uri_t audio_level = { .uri = "/audio/level", .method = HTTP_GET, .handler = audio_level_handler, .user_ctx = NULL };
+    httpd_uri_t activity = { .uri = "/activity", .method = HTTP_GET, .handler = activity_handler, .user_ctx = NULL };
+    httpd_uri_t cmd = { .uri = "/cmd", .method = HTTP_POST, .handler = cmd_handler, .user_ctx = NULL };
 
     httpd_register_uri_handler(server, &root);
     httpd_register_uri_handler(server, &stream);
@@ -3512,9 +4366,13 @@ static void http_server_start(void)
     httpd_register_uri_handler(server, &audio_alaw);
     httpd_register_uri_handler(server, &audio_down);
     httpd_register_uri_handler(server, &audio_level);
+    httpd_register_uri_handler(server, &activity);
+    httpd_register_uri_handler(server, &cmd);
 
     ESP_LOGI(TAG, "HTTP 服务器已启动，端口 %d", HTTP_PORT);
     ESP_LOGI(TAG, "音频端点: /audio/alaw (上行G711) /audio/down (下行PCM) /audio/level (电平)");
+    ESP_LOGI(TAG, "活动检测端点: /activity (motion / human_present / low_light)");
+    ESP_LOGI(TAG, "家人指令端点: POST /cmd (watching / calling / content)");
 }
 
 /* ---------------- 任务创建辅助 ---------------- */
@@ -4477,6 +5335,65 @@ static void uart_cmd_task(void *arg)
                         msg = sp + 1;
                     }
                     inject_button_event(msg);
+                } else if (strncmp(line, "lcdprompt", 8) == 0) {
+                    /*
+                     * 屏幕提示自测 (需求文档 §3.8)。
+                     *
+                     *   lcdprompt                    -> 列出所有类型
+                     *   lcdprompt <类型> [文案]      -> 显示对应提示
+                     *
+                     * 类型: help / cancel / watching / calling / content
+                     */
+                    const char *sp = strchr(line, ' ');
+                    const char *arg = (sp && sp[1]) ? sp + 1 : "";
+                    const char *arg2 = (sp && strchr(sp + 1, ' ')) ? strchr(sp + 1, ' ') + 1 : "";
+
+                    if (arg[0] == '\0') {
+                        ESP_LOGI(TAG, "用法: lcdprompt <help|cancel|watching|calling|content> [文案]");
+                        ESP_LOGI(TAG, "  help     - 已通知家人 (10s)");
+                        ESP_LOGI(TAG, "  cancel   - 求助已取消 (5s)");
+                        ESP_LOGI(TAG, "  watching - 家人正在看画面 (5s)");
+                        ESP_LOGI(TAG, "  calling  - 家人正在呼叫您 (8s, 伴随提示音)");
+                        ESP_LOGI(TAG, "  content  - 干预内容 (10s, 可带自定义文案)");
+                    } else if (strcmp(arg, "help") == 0) {
+                        lcd_prompt_show(PROMPT_HELP_SENT, NULL, 0);
+                    } else if (strcmp(arg, "cancel") == 0) {
+                        lcd_prompt_show(PROMPT_HELP_CANCELED, NULL, 0);
+                    } else if (strcmp(arg, "watching") == 0) {
+                        lcd_prompt_show(PROMPT_WATCHING, NULL, 0);
+                    } else if (strcmp(arg, "calling") == 0) {
+                        lcd_prompt_show(PROMPT_CALLING, NULL, 0);
+                        audio_board_play_prompt_beep();
+                    } else if (strcmp(arg, "content") == 0) {
+                        lcd_prompt_show(PROMPT_CONTENT, arg2[0] ? arg2 : NULL, 0);
+                    } else {
+                        ESP_LOGE(TAG, "未知类型: %s", arg);
+                    }
+                } else if (strncmp(line, "actest", 6) == 0) {
+                    /*
+                     * 活动检测自测 (需求文档 §3.5)。
+                     *
+                     *   actest          打印当前活动状态 (JSON)
+                     *   actest stats    打印详细统计
+                     */
+                    char jbuf[512];
+                    if (activity_detect_to_json(jbuf, sizeof(jbuf)) > 0) {
+                        ESP_LOGI(TAG, "ACTIVITY %s", jbuf);
+                    } else {
+                        ESP_LOGE(TAG, "活动检测未初始化");
+                    }
+                    const activity_state_t *st = activity_detect_get_state();
+                    ESP_LOGI(TAG, "  分析帧数=%" PRIu32 " 状态变化=%" PRIu32
+                             " 连续有信号=%" PRIu32 " 平均亮度=%d",
+                             (uint32_t)st->analyze_count,
+                             (uint32_t)st->state_change_count,
+                             (uint32_t)st->active_streak,
+                             (int)st->avg_luma);
+                    ESP_LOGI(TAG, "  运动=%d(%.3f) 人形=%d(%.2f) 低光=%d 检测器=%d",
+                             (int)st->motion, (double)st->motion_ratio,
+                             (int)st->human_present, (double)st->human_score,
+                             (int)st->low_light,
+                             st->has_detector ? 1 : 0);
                 } else if (strncmp(line, "btnraw", 6) == 0) {
                     /*
                      * 打印按键原始电平 (排障用)。
@@ -4487,13 +5404,32 @@ static void uart_cmd_task(void *arg)
                     button_raw_dump(secs);
                 } else if (strncmp(line, "awregs", 6) == 0) {
                     aw9523b_dump_regs();
+                } else if (strcmp(line, "ispeed") == 0) {
+                    i2c_speed_probe();
+                } else if (strcmp(line, "iprobe") == 0) {
+                    /* 运行期跑一次 I2C 引脚物理探针, 与开机时的结果对照 */
+                    i2c_pin_physical_probe();
+                } else if (strcmp(line, "i2cdump") == 0) {
+                    /* 打印 I2C 总线【真实】电平 + 逐地址扫描 */
+                    {
+                        int sda = 0, scl = 0;
+                        board_i2c_real_levels(&sda, &scl);
+                        ESP_LOGW(TAG, "I2C 真实电平: SDA=%d SCL=%d", sda, scl);
+                    }
+                    i2c_scan_audio();
+                } else if (strcmp(line, "i2crecover") == 0) {
+                    /* 手动触发一次 I2C 总线恢复序列 */
+                    board_i2c_bus_recover();
+                } else if (strcmp(line, "awinit") == 0) {
+                    /* 手动重跑电源/背光/摄像头复位时序 (不开新摄像头) */
+                    camera_power_reset();
                 } else if (strncmp(line, "keytest", 7) == 0) {
                     aw_key_line_test();
                 } else if (strncmp(line, "bootpress", 9) == 0) {
                     boot_button_simulate();
                 } else {
                     ESP_LOGW(TAG, "未知命令: %s", line);
-                    ESP_LOGW(TAG, "可用: lcd0/lcd1/lcd2/stat/q/hash/conv 0|1/pda 0|1/wifioff/wifix/astat/adcreg/tone/astop/vol N/mgain N/cgain N/scan/axtest");
+                    ESP_LOGW(TAG, "可用: lcd0/lcd1/lcd2/stat/q/hash/conv 0|1/pda 0|1/wifioff/wifix/astat/adcreg/tone/astop/vol N/mgain N/cgain N/scan/axtest/actest/lcdprompt/evtest");
                 }
                 len = 0;
             }
@@ -4557,6 +5493,37 @@ static bool aw_key_state(uint8_t pin)
  *   evtest              注入一条默认文案的事件
  *   evtest <自定义文案>  注入一条自定义文案的事件 (验证文案可配置)
  */
+/*
+ * 把一个看护事件同时送进推模式队列 (push_client)。
+ *
+ * 为什么事件要走【两条路】:
+ *   1. s_event_queue —— 拉模式。浏览器轮询 GET /event 取走。
+ *      这是可行性验证阶段唯一的通道, 还在用。
+ *   2. push_client  —— 推模式。设备主动 TCP 连到电脑推出去。
+ *      这是需求文档 §3.9 的要求, 断网时会缓存, 恢复后补传。
+ *
+ * 两条路【互不抢事件】: 队列里的事件被浏览器取走了, 推模式那份还在。
+ * 这不是 bug —— 电脑端 recv_event.py 按 seq 去重, 收到重复的会忽略。
+ * 好处是: 网页开着也能让后台服务同时收到事件。
+ *
+ * seq 用【事件发生时刻】的毫秒时间戳, 不是自增序号 ——
+ * 这样两条路上的同一个事件 seq 相同, 电脑端能准确去重。
+ */
+static void push_event_to_cloud(uint32_t seq, uint64_t ts_ms,
+                                const char *type, const char *msg)
+{
+    char body[320];
+    int n = snprintf(body, sizeof(body),
+                     "\"type\":\"%s\",\"msg\":\"%s\",\"seq\":%u,\"ts\":%llu",
+                     type ? type : "event",
+                     msg ? msg : "",
+                     (unsigned)seq,
+                     (unsigned long long)ts_ms);
+    if (n > 0 && n < (int)sizeof(body)) {
+        push_client_submit_event(body);
+    }
+}
+
 static void inject_button_event(const char *msg)
 {
     button_event_t ev;
@@ -4571,6 +5538,9 @@ static void inject_button_event(const char *msg)
         return;
     }
     ESP_LOGI(TAG, "已注入按键事件: %s", ev.message);
+
+    /* §3.9: 同时进推模式队列, 断网时缓存, 恢复后补传 */
+    push_event_to_cloud(ev.seq, ev.ts_ms, "button", ev.message);
 }
 
 /*
@@ -4795,6 +5765,9 @@ static void button_task(void *arg)
     ESP_LOGI(TAG, "按键已配置 (BOOT=GPIO%d=事件, K1(XIO%d)=音量-, K2(XIO%d)=音量+)",
              BTN_BOOT_GPIO, XIO_KEY_K1, XIO_KEY_K2);
 
+    /* §3.9 看门狗: 订阅本任务 (老人唯一能主动求助的通道, 卡住必须复位) */
+    reliability_watch_task(xTaskGetCurrentTaskHandle(), "button_task");
+
     /*
      * 每个键单独跟踪"上一次是否按下", 各自独立消抖。
      *
@@ -4823,6 +5796,30 @@ static void button_task(void *arg)
     bool armed_k1   = false;
     bool armed_k2   = false;
 
+    /*
+     * 【长按撤销】状态机 (需求文档 §3.8)
+     *
+     * §3.8 要求:
+     *   求助短按 -> 上报 help_pressed, 屏幕显示「已通知家人」,
+     *               10s 内可长按撤销
+     *   取消长按 -> 上报 help_canceled, 屏幕显示「求助已取消」
+     *
+     * 怎么区分短按和长按:
+     *   【按下瞬间】就上报 help_pressed + 显示提示 —— 不能等松手才决定,
+     *   否则老人按完就松手, 家人要等好几秒才收到, 体验很差。
+     *   然后继续按住:
+     *     - 3 秒内松开 -> 普通短按, 什么都不用做
+     *     - 3 秒后还按住 -> 判定为长按, 上报 help_canceled
+     *
+     * 10s 窗口的含义:
+     *   求助提示本身显示 10 秒 (PROMPT_DUR_HELP_SENT)。
+     *   "可撤销"的窗口就是这 10 秒。超过 10 秒云端告警已经升级了,
+     *   这时撤销就没意义了。
+     */
+    bool     help_pending = false;         /* 已上报求助, 等撤销 */
+    int64_t  help_ts_ms = 0;               /* 上报求助的时刻 */
+    bool     longpress_fired = false;      /* 本次按压已经触发过长按 */
+
     while (true) {
         bool boot_down = (gpio_get_level(BTN_BOOT_GPIO) == 0);
         bool k1_down    = aw_key_state(XIO_KEY_K1);
@@ -4835,7 +5832,7 @@ static void button_task(void *arg)
 
         /* ---- BOOT 键: 产生看护事件 (按下瞬间触发, 松开重置) ---- */
         if (boot_down && !prev_boot && armed_boot) {
-            vTaskDelay(pdMS_TO_TICKS(30));     /* 消抖: 30ms 后还在按下才算数 */
+            vTaskDelay(pdMS_TO_TICKS(30));     /* 消抖: 30ms 后还在按住才算数 */
 
             if (gpio_get_level(BTN_BOOT_GPIO) == 0) {
                 uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
@@ -4851,9 +5848,64 @@ static void button_task(void *arg)
 
                     ESP_LOGI(TAG, "检测到 BOOT 按键按下，生成事件: %s", ev.message);
                     xQueueSend(s_event_queue, &ev, 0);
+
+                    /* §3.9: 推模式同步上报 (断网时缓存补传) */
+                    push_event_to_cloud(ev.seq, ev.ts_ms, "button", ev.message);
+
+                    /*
+                     * §3.8 屏幕提示: 「已通知家人」
+                     *
+                     * 同时进入"可撤销"状态 —— 接下来 10 秒内长按可以撤销。
+                     */
+                    help_pending = true;
+                    longpress_fired = false;
+                    help_ts_ms = esp_timer_get_time() / 1000;
+                    lcd_prompt_show(PROMPT_HELP_SENT, NULL, 0);
                 }
             }
         }
+
+        /*
+         * 【长按撤销】检测。
+         *
+         * 按住超过 LONGPRESS_CANCEL_MS (3s) 且还没触发过长按 -> 触发一次。
+         * 触发后就不再重复 —— 否则一直按着会刷出一堆 help_canceled。
+         */
+        if (boot_down && help_pending && !longpress_fired) {
+            if ((esp_timer_get_time() / 1000) - help_ts_ms >= LONGPRESS_CANCEL_MS) {
+                longpress_fired = true;
+                help_pending = false;
+
+                /* 上报 help_canceled —— 云端据此关闭该告警 */
+                button_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.has_event = true;
+                ev.seq = (uint32_t)(esp_timer_get_time() / 1000);
+                ev.ts_ms = esp_timer_get_time() / 1000;
+                snprintf(ev.message, sizeof(ev.message), "%s", HELP_CANCEL_MESSAGE);
+
+                ESP_LOGI(TAG, "检测到长按 (%.1f 秒)，撤销求助",
+                         LONGPRESS_CANCEL_MS / 1000.0);
+                xQueueSend(s_event_queue, &ev, 0);
+
+                /* §3.9: 推模式同步上报 */
+                push_event_to_cloud(ev.seq, ev.ts_ms, "button", ev.message);
+
+                /* §3.8 屏幕提示: 「求助已取消」 */
+                lcd_prompt_show(PROMPT_HELP_CANCELED, NULL, 0);
+            }
+        }
+
+        /* ---- 松开: 结束本次按压 ---- */
+        if (!boot_down && prev_boot) {
+            /*
+             * 短按松开 -> 撤销窗口关闭 (没撤销就当求助成立)。
+             * 长按松开 -> 什么都不用做, 撤销已经在按住时上报了。
+             */
+            help_pending = false;
+            longpress_fired = false;
+        }
+
         prev_boot = boot_down;
 
         /* ---- K1/K2: 音量调节 (松开时触发, 避免长按连发) ---- */
@@ -4907,6 +5959,14 @@ static void button_task(void *arg)
             prev_k2 = k2_now;
         }
 
+        /*
+         * §3.9 看门狗: 喂狗。
+         *
+         * 按键任务是【最关键】的任务之一 —— 老人出事时唯一能主动做的
+         * 就是按这个键。这个任务卡住 = 求助功能失效 = 必须复位。
+         */
+        reliability_feed_watchdog();
+
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
@@ -4940,7 +6000,28 @@ void app_main(void)
      * 所以开机先拿 ITU-T 官方参考向量验一遍。 */
     g711_selftest();
 
+    /* I2C 引脚物理探针 —— 必须在任何 I2C 操作之前跑 */
+    i2c_pin_physical_probe();
+
     board_i2c_init();
+
+    /* I2C 多速率探测 —— 判断是不是上拉/时序问题 */
+    i2c_speed_probe();
+
+    /*
+     * 先做一次全地址扫描, 搞清楚总线上到底有什么。
+     *
+     * 【为什么要放在 camera_power_reset() 之前】
+     *   AW9523B 探测失败时, 我们需要知道:
+     *     - 是地址错了?      -> 扫描里能看到 0x58 或 0x59 应答
+     *     - 是总线被钳死?    -> SDA/SCL 电平全是 0 且无任何地址应答
+     *     - 是器件没上电?    -> 其他器件 (codec/摄像头) 应答, 只有 AW 不应答
+     *   这些结论决定了后面是"改地址"还是"修总线"还是"等上电",
+     *   所以必须先看全局, 不要一头扎进重试里。
+     */
+    i2c_scan_once();
+    task_start(i2c_monitor_task, "i2c_mon", 4096, 3);
+
     camera_power_reset();
 
 #if AUDIO_I2C_SCAN_ENABLE
@@ -4979,12 +6060,11 @@ void app_main(void)
         s_rgb_slots[i].len = 0;
         s_jpg_slots[i].len = 0;
     }
-    s_diag_copy_buf = heap_caps_malloc(DIAG_W * DIAG_H * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (s_diag_copy_buf == NULL) {
-        ESP_LOGE(TAG, "诊断缓冲分配失败 (内部RAM)");
-    } else {
-        ESP_LOGI(TAG, "诊断缓冲就绪: %dx%d 内部RAM", DIAG_W, DIAG_H);
-    }
+    /*
+     * 【2026-11-05 删除】原来的诊断副本缓冲 (38400 字节内部 RAM) 已移除:
+     * 它从来没被用过, 却把内部 RAM 挤到只剩 16.9KB,
+     * 直接导致 LCD 双缓冲申请失败 -> 屏幕全黑。
+     */
 
     /* 原始帧快照 (取证用, 走 /raw 端点导出) */
     s_raw_snapshot = heap_caps_malloc(RAW_SNAPSHOT_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -5000,6 +6080,26 @@ void app_main(void)
 
     camera_init();
 #endif
+
+    /*
+     * 活动检测 (需求文档 §3.5)。
+     *
+     * 必须在 camera_init() 之后 —— 分析器要拿到真实帧尺寸。
+     * 但要在 Wi-Fi / HTTP 之前, 因为它要分配 PSRAM 缓冲。
+     */
+    if (activity_detect_init() == ESP_OK) {
+        ESP_LOGI(TAG, "活动检测已就绪 (GET /activity 查看状态)");
+    }
+
+    /*
+     * 屏幕提示层 (需求文档 §3.8)。
+     *
+     * 在摄像头之后启动 —— 提示任务要往屏幕上画横幅,
+     * 必须等 LCD 初始化完 (lcd_st7789_init) 否则画上去也是乱的。
+     */
+    if (lcd_prompt_start() == ESP_OK) {
+        ESP_LOGI(TAG, "屏幕提示已就绪 (短按求助/长按撤销/家人指令提示)");
+    }
 
     /*
      * 音频: ES8311 (播放 DAC) + ES7210 (麦克风 ADC)。
@@ -5219,6 +6319,27 @@ void app_main(void)
 
 #if WIFI_ENABLE
     http_server_start();
+
+    /*
+     * 可靠性模块 (需求文档 §3.9)。
+     *
+     * 必须在 Wi-Fi 连上之后启动 —— 心跳要读 RSSI 和 IP。
+     */
+    if (reliability_start() == ESP_OK) {
+        ESP_LOGI(TAG, "可靠性模块已启动 (心跳 %d ms / 看门狗 / 降级模式)",
+                 RELIABILITY_HEARTBEAT_MS);
+    }
+
+    /*
+     * 推模式客户端 (需求文档 §3.9 断网缓存补传)。
+     *
+     * 连不上电脑端也没关系 —— 后台会一直按指数退避重试,
+     * 期间产生的事件会缓存起来 (N=20), 连上后自动补传。
+     */
+    if (push_client_start() == ESP_OK) {
+        ESP_LOGI(TAG, "推模式客户端已启动 (缓存 %d 事件 + %d 帧 JPEG)",
+                 PUSH_EVENT_MAX, PUSH_JPEG_MAX);
+    }
 #endif
 
     /*

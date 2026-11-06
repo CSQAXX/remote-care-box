@@ -51,9 +51,14 @@ esp_err_t lcd_fill_rect(int x, int y, int w, int h, uint16_t color);
  * @param w            图像宽 (像素)
  * @param h            图像高 (像素)
  * @param swap_bytes   true = 源数据是大端 (需要逐像素交换高低字节才能显示正确颜色)
+ * @param yield_between_batches
+ *                      true = 每画完一批 (20 行) 让出一次 CPU。
+ *                      必须开! 否则长时间连续占用 PSRAM 总线,
+ *                      摄像头的 DVP DMA 抢不到带宽 -> 下一帧丢行 -> 花屏。
+ *                      详见本文件里 lcd_draw_rgb565() 的注释。
  */
 esp_err_t lcd_draw_rgb565(const void *src, int src_stride, int x, int y, int w, int h,
-                           bool swap_bytes);
+                           bool swap_bytes, bool yield_between_batches);
 
 /**
  * @brief 画测试图样 (不依赖摄像头), 用来单独验证 LCD 传输链路
@@ -113,6 +118,13 @@ esp_err_t lcd_draw_frame_diagnostic(const void *src, int src_stride, int w, int 
  */
 esp_err_t lcd_draw_quad_diagnostic(const void *src, int src_stride, int w, int h,
                                    bool swap_bytes, uint8_t *copy_buf);
+
+/**
+ * @brief 运行时调节 LCD 的 SPI 时钟频率 (A/B 定位 "SPI 时钟太快导致花屏")
+ *
+ * @param hz 目标 SCLK 频率, 例如 40000000 / 20000000 / 10000000
+ */
+esp_err_t lcd_set_spi_clock(int hz);
 
 #ifdef __cplusplus
 }
