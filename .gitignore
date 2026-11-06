@@ -51,6 +51,16 @@ firmware/mjpeg_dump/
 
 # ---- 排障期临时探查脚本 (前缀下划线, 用完即弃) ----
 tools/_*.py
+firmware/main/_patch*.py
+
+# ---- 排障期根目录临时日志 (已归档进 firmware/tools_diag/) ----
+/t1.txt
+/stat_out.txt
+/iprobe*.txt
+/i2cdump*.txt
+/lcd_boot.txt
+/boot*.log
+/cold_boot.log
 
 # ---- 聊天记录归档: 无关项目的会话体积大, 不入库 ----
 docs/chats/C_Users_*.md
