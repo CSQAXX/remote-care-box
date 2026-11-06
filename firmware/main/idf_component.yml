@@ -9,3 +9,18 @@ dependencies:
   #       (components/esp_lcd/src/esp_lcd_panel_st7789.c)，无需外部依赖。
   #       esp_lcd_st7789 独立组件在 components.espressif.com 上是 403，
   #       所以不引外部包。
+
+  # ---------------------------------------------------------------------------
+  # 人形检测 (v1.0 需求文档 §3.5)
+  #
+  # 用 pedestrian_detect 而不是 human_face_detect:
+  #   - 需求要的是「屋里有没有人」, 不是「认不认识这个人」
+  #   - pico_s8 是 ESP32-S3 上的 INT8 量化版, 模型 435KB
+  #   - 依赖 esp-dl (~3.3.14), 组件服务器可访问
+  #
+  # 若 esp-dl 拉不下来, 活动检测模块会退化成纯帧差分模式:
+  # motion 字段照常上报, human_present 恒为 false (见 activity_detect.h)
+  # ---------------------------------------------------------------------------
+  espressif/esp-dl: "~3.3.14"
+  espressif/pedestrian_detect: "~0.3.3"
+

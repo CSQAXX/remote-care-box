@@ -53,6 +53,34 @@ CONFIG_SCCB_HARDWARE_I2C_DRIVER_LEGACY=y
 CONFIG_SCCB_HARDWARE_I2C_PORT0=y
 CONFIG_SCCB_CLK_FREQ=100000
 
+# ---- 音频 codec (板载 ES8311 + ES7210, I2C 实测 0x18 / 0x40) ----
+# 只开用得上的两个, 其余 codec 驱动全部关掉省 Flash。
+CONFIG_CODEC_ES8311_SUPPORT=y
+CONFIG_CODEC_ES7210_SUPPORT=y
+CONFIG_CODEC_ES8388_SUPPORT=n
+CONFIG_CODEC_ES8389_SUPPORT=n
+CONFIG_CODEC_ES8156_SUPPORT=n
+CONFIG_CODEC_ES8374_SUPPORT=n
+CONFIG_CODEC_ES7243_SUPPORT=n
+CONFIG_CODEC_ES7243E_SUPPORT=n
+CONFIG_CODEC_CJC8910_SUPPORT=n
+CONFIG_CODEC_AW88298_SUPPORT=n
+CONFIG_CODEC_TAS5805M_SUPPORT=n
+CONFIG_CODEC_ZL38063_SUPPORT=n
+CONFIG_CODEC_DUMMY_SUPPORT=n
+# 音频数据通路走 I2S
+CONFIG_CODEC_DATA_ADC_SUPPORT=n
+# 关键: 强制用旧版 I2C 驱动 —— 我们的 I2C0 (SDA=3/SCL=2) 上已经装了
+# 旧版 driver/i2c.h 驱动 (摄像头 SCCB + AW9523B 共用), 新版 i2c_master
+# 和旧版不能同时初始化同一个端口, 否则启动时 abort。
+CONFIG_CODEC_I2C_BACKWARD_COMPATIBLE=y
+
+# ---- main 任务栈加大 ----
+# 关键: 默认 3584 字节。加入音频初始化 (esp_codec_dev -> ES8311/ES7210
+# 驱动 -> 内部还有多��层调用) 后栈不够, 实测直接 "stack overflow in task main"。
+# 给到 8192, 留足余量。
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
 # ---- Wi-Fi: 需要 SoftAP (板子自己开热点) ----
 CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
 CONFIG_LWIP_LOCAL_HOSTNAME="kanhu-box"
@@ -60,3 +88,25 @@ CONFIG_LWIP_LOCAL_HOSTNAME="kanhu-box"
 # ---- 分区表：留足空间给后续 OTA ----
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- SNTP 网络对时 (需求文档 §3.9 / §6.3) ----
+# 设备没有 RTC, 开机后系统时间 = 编译时刻。告警时间戳、活动检测的
+# last_active_ts、夜间规则全都依赖真实时间, 所以必须联网对时。
+#
+# MAX_SERVERS=4: 配多个国内服务器 (阿里云/腾讯云) 轮询,
+# 单个服务器挂掉时不会导致整个设备时间不对。
+# 默认值是 1, 传多于 1 个服务器时 esp_netif_sntp_init 会返回
+# ESP_ERR_INVALID_ARG (踩过这个坑)。
+CONFIG_LWIP_SNTP_MAX_SERVERS=4
+# 对时后每 1 小时重新校一次, 抵消晶振漂移
+CONFIG_LWIP_SNTP_UPDATE_DELAY=3600000
+
+# ---- 人形检测模型 (需求文档 §3.5) ----
+# pedestrian_detect pico_s8_v1 (INT8, ESP32-S3)
+# 模型存在固件 rodata 里 (435KB), 不占 PSRAM。
+CONFIG_PEDESTRIAN_DETECT_MODEL_IN_FLASH_RODATA=y
+CONFIG_PEDESTRIAN_DETECT_MODEL_IN_FLASH_PARTITION=n
+CONFIG_PEDESTRIAN_DETECT_MODEL_IN_SDCARD=n
+CONFIG_FLASH_PEDESTRIAN_DETECT_PICO_S8_V1=y
+CONFIG_DEFAULT_PEDESTRIAN_DETECT_MODEL=0
+
