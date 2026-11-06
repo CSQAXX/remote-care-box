@@ -36,3 +36,22 @@ secrets/
 *.log
 logs/
 tmp/
+
+# ---- 取证产物 (花屏排查期产生, 体积大且无长期价值) ----
+# 原始帧抓取: firmware/tools_diag/frames/ 下的 .bin / .rgb565
+firmware/tools_diag/frames/
+*.rgb565
+# 诊断用图片 (docs/evidence/diag/ 已归档的取证截图)
+docs/evidence/diag/
+# 排障期临时输出目录
+firmware/out/
+firmware/mjpeg_dump/
+# 提交信息草稿
+.git_commit_msg*.txt
+
+# ---- 排障期临时探查脚本 (前缀下划线, 用完即弃) ----
+tools/_*.py
+
+# ---- 聊天记录归档: 无关项目的会话体积大, 不入库 ----
+docs/chats/C_Users_*.md
+docs/chats/序号_*.md
