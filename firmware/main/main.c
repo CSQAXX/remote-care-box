@@ -82,6 +82,26 @@ static const char *TAG = "kanhu";
 #define HTTP_PORT       8080
 
 /*
+ * 【2026-11-06】控制面端口 —— 数据面/控制面分离。
+ *
+ * 8080 数据面: /stream /raw /audio/alaw /audio/down  (长连接, 允许被占满)
+ * 8081 控制面: /health /activity /event /notify /cmd  (短请求, 独立 server)
+ *
+ * 为什么要分: IDF 的 httpd 客户端 socket 槽位被硬限制在
+ * max_open_sockets(最多7) - 内部占3 = 4 个。/stream 一个客户端就长期占住
+ * 1 个 socket + 1 个 worker。几个客户端一连上, 同端口的 /health 就全部
+ * 排队 -> 表现为"板子 HTTP 挂了", 但相机其实还在正常跑 (实测复现)。
+ *
+ * ⚠️ 关键: IDF 的 httpd 用一个【固定端口的 ctrl socket】(默认 32768)
+ *    做内部事件通知, 两个实例如果用同一个 ctrl_port 就会
+ *    EADDRINUSE (errno 112) 导致第二个实例起不来。
+ *    httpd_config_t.ctrl_port 就是为这个准备的 —— 必须给第二个实例
+ *    配一个不同的 ctrl_port 才能共存。详见 httpd_control_start()。
+ */
+#define HTTP_CONTROL_PORT 8081
+#define HTTP_CONTROL_CTRL_PORT 32769   /* 控制面实例的 ctrl socket 端口 */
+
+/*
  * Wi-Fi 总开关。必须定义在文件靠前的位置 —— audio_selftest_loop()
  * 里有 #if WIFI_ENABLE 的编译期分支, 定义晚了那里会当成 0。
  *
@@ -174,7 +194,52 @@ static QueueHandle_t        s_event_queue;
 static EventGroupHandle_t   s_wifi_events;
 static esp_netif_t         *s_netif;
 static volatile int         s_stream_clients = 0;
+static volatile int         s_long_conns = 0;   /* 长连接总配额 (视频+音频) */
 static uint32_t             s_frame_count = 0;
+
+/*
+ * 【2026-11-06】推流并发上限。
+ *
+ * IDF 的 http_server max_open_sockets 硬上限 7 (内部占 3, 客户端最多 4),
+ * 每个活跃请求占 1 socket + 1 worker。留 2 个给 /health /activity /event
+ * 这些短请求 —— "收告警"是刚需, "看画面"可以等。
+ */
+#define STREAM_MAX_CLIENTS 2
+
+/*
+ * 【2026-11-06】长连接总配额 (视频 + 音频 共享, 全局计数)。
+ *
+ * 背景: 控制面已经拆到独立端口 8081 (见 httpd_control_start()), 所以
+ * 8080 上的长连接不再会挤掉 /health —— 短请求走控制面, 长连接走数据面。
+ *
+ * 但这个计数器是【全局】的 (两个 server 共享), 而音频端点同时注册在
+ * 数据面和控制面, 所以这里设 4: 允许"数据面 2 路视频 + 控制面 1 路音频
+ * 上行 + 控制面 1 路其它长连接"。真正的兜底还是各 server 自己的
+ * socket 槽位 (数据面 4, 控制面 6)。
+ */
+#define LONG_CONN_MAX 4
+
+/*
+ * 长连接配额管理。
+ *
+ * 取配额: 返回 true 表示拿到, false 表示超限 (调用方回 503)。
+ * 释放配额: 必须在长连接结束时调用 (所有退出路径都要覆盖)。
+ */
+static bool long_conn_acquire(void)
+{
+    if (s_long_conns >= LONG_CONN_MAX) {
+        return false;
+    }
+    s_long_conns++;
+    return true;
+}
+
+static void long_conn_release(void)
+{
+    if (s_long_conns > 0) {
+        s_long_conns--;
+    }
+}
 
 /* ---------------- 帧槽位 (生产者 / 消费者) ---------------- */
 
@@ -1668,9 +1733,6 @@ static void i2c_speed_probe(void)
  */
 static bool board_i2c_bus_recover(void)
 {
-    const int scl_pin = BOARD_I2C_SCL_PIN;
-    const int sda_pin = BOARD_I2C_SDA_PIN;
-
     /*
      * 【为什么必须用 HAL 层, 不能用 GPIO 手动打脉冲】
      *
@@ -3657,8 +3719,42 @@ static esp_err_t root_handler(httpd_req_t *req)
 /* MJPEG 流的分块发送器 */
 static esp_err_t stream_handler(httpd_req_t *req)
 {
+    /*
+     * 【2026-11-06】限制并发推流客户端数。
+     *
+     * ESP-IDF 的 http_server:
+     *   - max_open_sockets 硬上限 7 (内部占 3, 客户端最多 4)
+     *   - 每个活跃请求占用 1 个 socket + 1 个 httpd worker 线程
+     * /stream 是长连接, 一个客户端就长期占住这两个资源。
+     *
+     * 实测事故: 控制台代理 + 几个浏览器标签页一起连, 把 4 个槽位占满,
+     * /health /activity /event 这些短请求全部排队 -> 表现为"板子 HTTP 挂了",
+     * 但串口里相机其实还在正常跑 (5.8 fps), 板子本身没死。
+     *
+     * 所以这里必须【主动限流】: 超过上限直接回 503, 让客户端稍后重试,
+     * 把 socket 槽位留给短请求。短请求才是"看护"场景的刚需 ——
+     * 画面卡可以接受, 收告警绝不能卡。
+     */
+    if (s_stream_clients >= STREAM_MAX_CLIENTS) {
+        ESP_LOGW(TAG, "推流客户端已满 (%d)，拒绝新连接", STREAM_MAX_CLIENTS);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "text/plain; charset=utf-8");
+        httpd_resp_sendstr(req, "too many stream clients");
+        return ESP_FAIL;
+    }
+
+    /* 长连接总配额 (视频 + 音频 共享) —— 留 1 个槽位给短请求 */
+    if (!long_conn_acquire()) {
+        ESP_LOGW(TAG, "长连接配额已满 (%d)，拒绝推流", LONG_CONN_MAX);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "text/plain; charset=utf-8");
+        httpd_resp_sendstr(req, "too many long connections");
+        return ESP_FAIL;
+    }
+
     s_stream_clients++;
-    ESP_LOGI(TAG, "画面客户端接入，当前 %d 个", s_stream_clients);
+    ESP_LOGI(TAG, "画面客户端接入，当前 %d 个 (长连接 %d)",
+             s_stream_clients, s_long_conns);
 
     /*
      * 【踩过的坑】不能用 httpd_resp_send() 来发 multipart 响应头!
@@ -3728,7 +3824,9 @@ static esp_err_t stream_handler(httpd_req_t *req)
     }
 
     s_stream_clients--;
-    ESP_LOGI(TAG, "画面客户端断开，剩余 %d 个", s_stream_clients);
+    long_conn_release();
+    ESP_LOGI(TAG, "画面客户端断开，剩余 %d 个 (长连接 %d)",
+             s_stream_clients, s_long_conns);
     return ESP_OK;
 }
 
@@ -3997,7 +4095,7 @@ static esp_err_t health_handler(httpd_req_t *req)
 
     char resp[768];
     snprintf(resp, sizeof(resp),
-             "{\"ip\":\"" IPSTR "\",\"uptime\":%llu,\"frames\":%" PRIu32 ",\"clients\":%d,"
+             "{\"ip\":\"" IPSTR "\",\"uptime\":%llu,\"frames\":%" PRIu32 ",\"clients\":%d,\"long_conns\":%d,"
              "\"psram\":%" PRIu32 ","
              "\"cam_frames\":%" PRIu32 ",\"jpg_frames\":%" PRIu32 ",\"jpg_bytes\":%" PRIu32 ","
              "\"cam_get_us\":%" PRIu32 ",\"rgb_copy_us\":%" PRIu32 ",\"jpg_encode_us\":%" PRIu32 ","
@@ -4018,6 +4116,7 @@ static esp_err_t health_handler(httpd_req_t *req)
              (unsigned long long)(esp_timer_get_time() / 1000),
              (uint32_t)s_frame_count,
              s_stream_clients,
+             s_long_conns,
              (uint32_t)esp_psram_get_size(),
              (uint32_t)s_cam_frames,
              (uint32_t)s_jpg_frames,
@@ -4132,6 +4231,19 @@ static esp_err_t audio_alaw_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    /*
+     * 【2026-11-06】音频上行也是长连接, 和 /stream 共享 socket 配额。
+     * 见 long_conn_acquire() 的注释: 客户端槽位只有 4 个,
+     * 长连接必须限流, 否则 /health /event 这些短请求会全被挤掉。
+     */
+    if (!long_conn_acquire()) {
+        ESP_LOGW(TAG, "长连接配额已满 (%d)，拒绝音频上行", LONG_CONN_MAX);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "text/plain; charset=utf-8");
+        httpd_resp_sendstr(req, "too many long connections");
+        return ESP_FAIL;
+    }
+
     httpd_resp_set_type(req, "audio/basic");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     /* 告诉客户端这是 8bit A-law, 16kHz, 单声道 */
@@ -4143,6 +4255,7 @@ static esp_err_t audio_alaw_handler(httpd_req_t *req)
     if (pcm == NULL || alaw == NULL) {
         free(pcm);
         free(alaw);
+        long_conn_release();
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no memory");
         return ESP_FAIL;
     }
@@ -4171,6 +4284,7 @@ static esp_err_t audio_alaw_handler(httpd_req_t *req)
 
     free(pcm);
     free(alaw);
+    long_conn_release();
     httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
@@ -4320,12 +4434,52 @@ static esp_err_t audio_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static void httpd_control_start(void);
+
 static void http_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_PORT;
     config.max_uri_handlers = 16;
     config.stack_size = 10240;
+    /*
+     * 【2026-11-06 修复"板子 HTTP 全部 502"】
+     *
+     * HTTPD_DEFAULT_CONFIG() 的 max_open_sockets 只有 7。而 /stream 和
+     * /audio/alaw 都是【长连接】—— 一个浏览器标签页就能占掉 1 个 socket,
+     * 代理端再重试几次, 槽位就被占光, 结果 /health /activity 这些短请求
+     * 也排队 -> 整个 HTTP 服务看着像挂了。
+     *
+     * 现场证据: 控制台代理反复重连 /stream, 板子随后 /health 全部 502,
+     *           但串口日志显示相机还在跑 (5.8 fps) —— 说明板子活着, 只是
+     *           HTTP 槽位耗尽。
+     *
+     * ⚠️ 注意: ESP-IDF 对这个值有【硬上限】。IDF 5.3 的 httpd 内部固定
+     *    占用 3 个 socket, 最多只能再开 4 个给客户端, 所以 max_open_sockets
+     *    最大只能填 7。填 12 会直接:
+     *        E httpd: Config option max_open_sockets is too large
+     *                 (max allowed 7, 3 sockets used by HTTP server internally)
+     *        E kanhu: HTTP 服务器启动失败: ESP_ERR_INVALID_ARG
+     *    —— 整个 HTTP 服务直接起不来 (这正是本次踩的坑)。
+     *
+     * 所以光加 socket 数量不够, 必须同时:
+     *   1) 代理端只维持【一条】上游长连接 (见 pc_receiver/pc_console.py
+     *      的 SharedStream), 多个浏览器标签页共用;
+     *   2) 短请求不能被长连接挤掉 —— 见下面的 lru_purge_enable。
+     */
+    config.max_open_sockets = 7;   /* IDF 硬上限, 不能再大 */
+    /*
+     * 【2026-11-06】开 LRU 回收: 客户端异常断开后, socket 不立刻归还,
+     * 靠 LRU 超时淘汰, 否则反复重连会持续消耗槽位。
+     */
+    config.lru_purge_enable = true;
+    /*
+     * 【2026-11-06】HTTP 超时必须设, 否则一个卡住的长连接会永久占住
+     * 一个 worker。recv_wait_timeout 是等首字节, send_wait_timeout 是等
+     * 发送完成。10s 足够正常传输, 又不会让死连接长期占坑。
+     */
+    config.recv_wait_timeout = 10;
+    config.send_wait_timeout = 10;
     /*
      * 钉到 core 0 —— 和 cam_task / 其它任务同核。
      *
@@ -4373,6 +4527,128 @@ static void http_server_start(void)
     ESP_LOGI(TAG, "音频端点: /audio/alaw (上行G711) /audio/down (下行PCM) /audio/level (电平)");
     ESP_LOGI(TAG, "活动检测端点: /activity (motion / human_present / low_light)");
     ESP_LOGI(TAG, "家人指令端点: POST /cmd (watching / calling / content)");
+
+    httpd_control_start();
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * 【2026-11-06 新增】控制面 HTTP 服务器 (端口 8081) —— 数据面/控制面分离
+ * ---------------------------------------------------------------------------
+ *
+ * 【要解决的问题】
+ *   主服务器(8080)上既有 /stream 这种【长连接大流量】, 又有 /health 这种
+ *   【短请求】。ESP-IDF 的 http_server:
+ *     - 客户端 socket 槽位 = max_open_sockets - 3 (内部占用), 上限只有 4
+ *     - 每个活跃请求占用 1 个 socket + 1 个 httpd worker 线程
+ *   /stream 一个客户端就长期占住这两个资源。
+ *   几个客户端一连上, /health /activity /event 就全部排队甚至超时 ——
+ *   表现就是"板子像挂了", 但串口里相机其实还在正常跑 (5.8 fps)。
+ *
+ *   实测事故: 3 路浏览器 + 代理重连 -> 板子 /health 连续超时,
+ *   而串口 PROD 日志一直显示 5.8fps 正常出图。
+ *
+ * 【解法: 控制面/数据面分离】
+ *   8080  数据面: /stream /raw /audio/alaw /audio/down (长连接, 允许被占满)
+ *   8081  控制面: /health /activity /event /notify /cmd (短请求, 独立 server)
+ *
+ *   两个 server 各有自己的 socket 池和 worker 池, 互不影响。
+ *   数据面被 MJPEG 占满时, 控制面依然能立刻响应 —— 这正是"看护"场景
+ *   需要的: 画面卡可以接受, 但"查状态/收告警"绝不能卡。
+ *
+ * 【必须配不同的 ctrl_port】
+ *   IDF 的 httpd 用一个 UDP ctrl socket 做内部事件通知, 默认端口 32768
+ *   (ESP_HTTPD_DEF_CTRL_PORT)。两个实例共用它 -> bind 失败 errno 112:
+ *       E httpd: httpd_server_init: error in creating ctrl socket (112)
+ *   httpd_config_t.ctrl_port 就是为此准备的, 给第二个实例配 32769 即可。
+ */
+static void httpd_control_start(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = HTTP_CONTROL_PORT;
+    config.ctrl_port = HTTP_CONTROL_CTRL_PORT;   /* 必须不同于主实例的 32768 */
+    /*
+     * ⚠️ max_uri_handlers 必须 >= 实际注册的 URI 数量, 否则超出的注册
+     *    会【静默失败】(httpd_register_uri_handler 返回错误但这里没检查),
+     *    表现为该端点 404 "Nothing matches the given URI"。
+     *
+     * 目前控制面注册 9 个:
+     *   /health /activity /event /notify /cmd /root
+     *   /audio/level /audio/alaw /audio/down
+     * 所以至少要 12 留点余量。
+     */
+    config.max_uri_handlers = 12;
+    config.stack_size = 4096;          /* 控制面 handler 很轻, 栈可以小 */
+    config.max_open_sockets = 6;       /* 控制面: 短请求 + 音频长连接 */
+    config.lru_purge_enable = true;
+    config.recv_wait_timeout = 5;
+    config.send_wait_timeout = 5;
+    config.core_id = APP_CORE_ID;
+
+    httpd_handle_t server = NULL;
+    esp_err_t ret = httpd_start(&server, &config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "控制面 HTTP 服务器启动失败: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    httpd_uri_t health = { .uri = "/health", .method = HTTP_GET, .handler = health_handler, .user_ctx = NULL };
+    httpd_uri_t activity = { .uri = "/activity", .method = HTTP_GET, .handler = activity_handler, .user_ctx = NULL };
+    httpd_uri_t ev = { .uri = "/event", .method = HTTP_GET, .handler = event_handler, .user_ctx = NULL };
+    httpd_uri_t notify = { .uri = "/notify", .method = HTTP_POST, .handler = notify_handler, .user_ctx = NULL };
+    httpd_uri_t cmd = { .uri = "/cmd", .method = HTTP_POST, .handler = cmd_handler, .user_ctx = NULL };
+    httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_handler, .user_ctx = NULL };
+
+    /*
+     * 音频端点也注册到控制面。
+     *
+     * 为什么要重复注册: 音频上行 /audio/alaw 是长连接, 下行 /audio/down
+     * 是大 body 的 POST。两者原本都在数据面(8080), 而数据面被 MJPEG 占满时
+     * 它们就完全没法用 —— 实测"看画面"和"对讲"无法同时进行, 这对看护场景
+     * 是不可接受的 (画面可以卡, 但子女要能随时喊话)。
+     *
+     * 控制面的 socket 槽位和 worker 池是独立的, 所以音频在这里不受
+     * MJPEG 影响。同一端口在两个 server 上注册不同的 URI 不冲突。
+     */
+    httpd_uri_t audio_level = { .uri = "/audio/level", .method = HTTP_GET, .handler = audio_level_handler, .user_ctx = NULL };
+    httpd_uri_t audio_alaw = { .uri = "/audio/alaw", .method = HTTP_GET, .handler = audio_alaw_handler, .user_ctx = NULL };
+    httpd_uri_t audio_down = { .uri = "/audio/down", .method = HTTP_POST, .handler = audio_down_handler, .user_ctx = NULL };
+
+    /*
+     * 【2026-11-06】校验关键端点是否真的注册上了。
+     *
+     * httpd_register_uri_handler 失败时【不报错】, 只是那个 URI 404。
+     * 之前 max_uri_handlers 设成 8 而实际注册 9 个, /audio/down 就被静默
+     * 丢掉了, 表现为对讲下发 404 —— 极难排查。
+     * 这里把每个注册结果都打出来, 一眼就能看出少了哪个。
+     */
+    struct { const char *uri; esp_err_t err; } regs[] = {
+        {"/health",       httpd_register_uri_handler(server, &health)},
+        {"/activity",     httpd_register_uri_handler(server, &activity)},
+        {"/event",        httpd_register_uri_handler(server, &ev)},
+        {"/notify",       httpd_register_uri_handler(server, &notify)},
+        {"/cmd",          httpd_register_uri_handler(server, &cmd)},
+        {"/",             httpd_register_uri_handler(server, &root)},
+        {"/audio/level",  httpd_register_uri_handler(server, &audio_level)},
+        {"/audio/alaw",   httpd_register_uri_handler(server, &audio_alaw)},
+        {"/audio/down",   httpd_register_uri_handler(server, &audio_down)},
+    };
+    int reg_fail = 0;
+    for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+        if (regs[i].err != ESP_OK) {
+            ESP_LOGE(TAG, "控制面端点 %s 注册失败: %s",
+                     regs[i].uri, esp_err_to_name(regs[i].err));
+            reg_fail++;
+        }
+    }
+    if (reg_fail == 0) {
+        ESP_LOGI(TAG, "控制面 %d 个端点全部注册成功",
+                 (int)(sizeof(regs) / sizeof(regs[0])));
+    }
+
+    ESP_LOGI(TAG, "控制面 HTTP 服务器已启动，端口 %d", HTTP_CONTROL_PORT);
+    ESP_LOGI(TAG, "  控制面端点: /health /activity /event /notify /cmd");
+    ESP_LOGI(TAG, "  控制面音频: /audio/alaw /audio/down /audio/level  (与画面互不干扰)");
 }
 
 /* ---------------- 任务创建辅助 ---------------- */
