@@ -27,6 +27,9 @@
 #include <inttypes.h>
 #include <string.h>
 #include <stdlib.h>
+/* MSG_PEEK 零副作用探测客户端断开 (见 stream_client_alive) */
+#include <sys/select.h>
+#include <sys/socket.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -74,6 +77,7 @@
 #include "lcd_prompt.h"
 #include "push_client.h"
 #include "reliability.h"
+#include "power_board.h"
 
 #include <math.h>
 
@@ -1866,6 +1870,26 @@ static void camera_power_reset(void)
     aw9523b_set_output(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_KEY_K2, false);
 
     /*
+     * 【电池电路方向】XIO2 输出 / XIO3 输入。
+     *
+     * 正点原子官方 config.h 里:
+     *   XIO_BAT_CHRG_EN (XIO2) = 电池采样使能, 【输出】, 拉低导通分压
+     *   XIO_BAT_CHRG    (XIO3) = 充电状态,   【输入】, 低 = 正在充电
+     *
+     * 为什么必须单独处理:
+     *   官方 DRV_IO_EXP_OUTPUT_MASK=0xFFFC / INPUT_MASK=0x0003 只把 K1/K2
+     *   当输入, XIO3 在官方那版是被当输出的 (那版固件没做电池检测)。
+     *   但 XIO3 是充电芯片的检测脚, 驱动它会短接检测电路, 状态是假的。
+     *   所以这里显式把 XIO3 改回输入。
+     *
+     * 注意: 这一步放在 aw9523b_set_p0_push_pull() 之前不影响效果 ——
+     *       CONFIG 寄存器 (方向) 和 CTL 寄存器 (推挽/开漏) 是两个独立寄存器,
+     *       推挽设置只影响【输出脚】的电平驱动方式, 不改变方向。
+     */
+    aw9523b_set_output(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_BAT_CHRG_EN, true);
+    aw9523b_set_output(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_BAT_CHRG, false);
+
+    /*
      * P0 端口的输出驱动模式设为【推挽】。
      *
      * AW9523B 的 P0 默认是开漏 (Open-Drain), 需要板子上有外部上拉电阻。
@@ -1909,6 +1933,13 @@ static void camera_power_reset(void)
     /* 背光: 低电平点亮 (官方 InitializeIoExpander 明确写 0) */
     aw9523b_set_level(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_LCD_BL, false);
 
+    /*
+     * 电池采样使能脚 XIO2 默认【拉高】(不导通分压)。
+     * 只有真正要读电量时才拉低, 读完立刻改回输入。
+     * 一直拉低 = 一直给电池挂分压电阻, 白耗电。
+     */
+    aw9523b_set_level(BOARD_I2C_PORT, AW9523B_I2C_ADDR, XIO_BAT_CHRG_EN, true);
+
     vTaskDelay(pdMS_TO_TICKS(100));
 
     /* 摄像头复位时序: 拉低保持 50ms -> 拉高等待 50ms */
@@ -1924,6 +1955,7 @@ static void camera_power_reset(void)
         ESP_LOGI(TAG, "AW9523B CONFIG: P0=0x%02x P1=0x%02x | OUTPUT: P0=0x%02x P1=0x%02x",
                  cfg0, cfg1, out0, out1);
         ESP_LOGI(TAG, "  期望: P1 bit3(3V3)=1 bit4(VBAT)=1 bit5(VDDA)=1 bit6(2V8)=1 bit7(RST)=1 bit0(BL)=0");
+        ESP_LOGI(TAG, "  期望: P0 bit2(BAT_CHRG_EN)=0(输出) bit3(BAT_CHRG)=1(输入)");
     }
 }
 
@@ -3717,6 +3749,55 @@ static esp_err_t root_handler(httpd_req_t *req)
 }
 
 /* MJPEG 流的分块发送器 */
+/*
+ * 【2026-11-07 新增】探测 /stream 客户端是否已断开 (零副作用)。
+ *
+ * 【为什么不能用 httpd_resp_send_chunk(req, NULL, 0)】
+ *   IDF 文档: "When you are finished sending all your chunks, you must
+ *   call this function with buf_len as 0."
+ *   也就是说 buf_len=0 的语义是【结束 chunked 响应】, 会发 "0\r\n\r\n"
+ *   终止符, 不是"发 0 字节探测"。
+ *
+ *   用它做探测的后果 (实测): 消费者只要超过 100ms 没等到新帧,
+ *   整个 multipart 流就被提前终止 -> 客户端停止读取并断开 -> 画面卡顿。
+ *
+ * 【怎么做到零副作用】
+ *   用 MSG_PEEK 读 socket:
+ *     - 返回 0    -> 对方发了 FIN (半关闭), 客户端已断开
+ *     - 返回 <0   -> 出错 (含 RST), 客户端已断开
+ *     - 返回 >0   -> 客户端发来了数据, peek 出来丢掉即可 (不影响)
+ *   全程不往线上写任何字节, 不会破坏 chunked 协议。
+ */
+static bool stream_client_alive(httpd_req_t *req)
+{
+    int fd = httpd_req_to_sockfd(req);
+    if (fd < 0) {
+        return false;
+    }
+
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(fd, &rfds);
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
+
+    /* 只等 0 秒: 有数据/异常立即返回, 没有就当"还活着" */
+    int r = select(fd + 1, &rfds, NULL, NULL, &tv);
+    if (r <= 0) {
+        return true;   /* 没动静 -> 还活着 */
+    }
+
+    char tmp[64];
+    int n = recv(fd, tmp, sizeof(tmp), MSG_PEEK);
+    if (n > 0) {
+        /* 客户端发来了数据, peek 掉不算消费, 协议上无害 */
+        return true;
+    }
+    if (n == 0) {
+        return false;  /* FIN: 对方已关闭写方向 */
+    }
+    return false;      /* 出错 (含 RST) */
+}
+
 static esp_err_t stream_handler(httpd_req_t *req)
 {
     /*
@@ -3815,10 +3896,10 @@ static esp_err_t stream_handler(httpd_req_t *req)
              * TCP 会返回错误, 我们就能立刻感知断开并释放 socket。
              */
             static int idle_ticks = 0;
-            if (++idle_ticks >= 5) {   /* 每 100ms 探一次 */
+            if (++idle_ticks >= 10) {   /* 每 20ms 一次 -> 200ms 探一次 */
                 idle_ticks = 0;
-                if (httpd_resp_send_chunk(req, NULL, 0) != ESP_OK) {
-                    ESP_LOGI(TAG, "画面客户端已断开 (空闲探测发现)");
+                if (!stream_client_alive(req)) {
+                    ESP_LOGI(TAG, "画面客户端已断开 (socket 探测发现)");
                     break;
                 }
             }
@@ -3844,6 +3925,25 @@ static esp_err_t stream_handler(httpd_req_t *req)
             break;
         }
         s_frame_count++;
+
+        /*
+         * 【2026-11-07 新增】发完一帧就探测一次客户端是否还在。
+         *
+         * 为什么不能只在"等不到新帧"时探测:
+         *   正常帧率 5fps, 每 190ms 就有新帧, 于是几乎永远走不到
+         *   那个分支 —— 客户端断开只能等下一次 send_chunk 失败,
+         *   而 TCP 发送失败要等内核重传超时 (可能好几秒), 期间
+         *   socket 和 STREAM_MAX_CLIENTS 配额一直被占着。
+         *
+         * 现场: 断连测试连开 3 路流后, 8080 直接连不上 (连接超时),
+         *       因为 2 个流配额被"已死但未释放"的连接占满。
+         *
+         * MSG_PEEK 是零副作用的, 每帧一次的开销可以忽略。
+         */
+        if (!stream_client_alive(req)) {
+            ESP_LOGI(TAG, "画面客户端已断开 (发帧后探测发现)");
+            break;
+        }
     }
 
     s_stream_clients--;
@@ -4116,7 +4216,22 @@ static esp_err_t health_handler(httpd_req_t *req)
     heartbeat_t hb;
     reliability_get_heartbeat(&hb);
 
-    char resp[768];
+    /*
+     * 电源 / 电池状态。
+     *
+     * 为什么要放进 /health:
+     *   "拔掉 Type-C 就没画面" 的根因是板子彻底断电 (AW9523B 一死,
+     *   所有外设电源轨全断)。要判断设备现在到底是 USB 供电还是电池供电,
+     *   以及电量还剩多少, 这是唯一不需要额外工具就能看到的地方。
+     *
+     * power_source 取值: "typec" / "battery" / "unknown"
+     */
+    power_status_t pst = power_board_get_status();
+    const char *psrc = "unknown";
+    if (pst.source == POWER_SOURCE_TYPEC)        psrc = "typec";
+    else if (pst.source == POWER_SOURCE_BATTERY)  psrc = "battery";
+
+    char resp[896];
     snprintf(resp, sizeof(resp),
              "{\"ip\":\"" IPSTR "\",\"uptime\":%llu,\"frames\":%" PRIu32 ",\"clients\":%d,\"long_conns\":%d,"
              "\"psram\":%" PRIu32 ","
@@ -4132,6 +4247,8 @@ static esp_err_t health_handler(httpd_req_t *req)
              "\"time_synced\":%s,\"epoch_ms\":%lld,"
              "\"rssi\":%d,\"free_heap\":%u,\"free_psram\":%u,"
              "\"mode\":\"%s\",\"camera_ok\":%s,"
+             "\"power_source\":\"%s\",\"charging\":%s,"
+             "\"battery_pct\":%d,\"battery_mv\":%d,\"battery_valid\":%s,"
              "\"push_connected\":%s,\"push_sent\":%u,\"push_jpegs\":%u,"
              "\"push_replayed\":%u,\"push_dropped\":%u,\"push_queued\":%u,"
              "\"push_fails\":%u,\"push_backoff_ms\":%u}",
@@ -4170,6 +4287,12 @@ static esp_err_t health_handler(httpd_req_t *req)
              (unsigned)hb.free_psram,
              (reliability_get_mode() == RELIABILITY_MODE_DEGRADED) ? "degraded" : "normal",
              hb.camera_ok ? "true" : "false",
+             /* 电源 / 电池 */
+             psrc,
+             pst.charging ? "true" : "false",
+             pst.percent,
+             pst.mv,
+             pst.valid ? "true" : "false",
              ps.connected ? "true" : "false",
              (unsigned)ps.sent_events,
              (unsigned)ps.sent_jpegs,
@@ -5703,6 +5826,64 @@ static void uart_cmd_task(void *arg)
                     button_raw_dump(secs);
                 } else if (strncmp(line, "awregs", 6) == 0) {
                     aw9523b_dump_regs();
+                } else if (strcmp(line, "bat") == 0) {
+                    /*
+                     * 打印电池 / 供电状态。
+                     *
+                     * 这是回答"板子上到底有没有装电池"的直接手段:
+                     *   - 电压落在 3.4V~4.2V -> 电池装好且有电
+                     *   - 读到 0V 或满量程 4095 -> 电池座空 / 接触不良 / 没有电池电路
+                     *
+                     * 注意: 内部有 500ms 阻塞延时 (等分压稳定)。
+                     */
+                    {
+                        power_status_t st = power_board_get_status();
+                        int adc = 0, mv = 0, pct = 0;
+                        if (power_board_read_battery(&adc, &mv, &pct) == ESP_OK) {
+                            /* valid = 读到了可信的电池电压 (按 ADC 原始码判定) */
+                            st.valid   = (adc >= BOARD_BAT_VALID_MIN_ADC);
+                            st.adc_raw = adc;
+                            st.mv      = mv;
+                            st.percent = pct;
+                            st.charging = power_board_is_charging();
+                            /* 用本轮读到的电压做交叉验证, 避免用到过期缓存 */
+                            st.source   = power_board_determine_source(&st);
+                        } else {
+                            st.valid = false;
+                        }
+
+                        char line_buf[160];
+                        power_board_format_status(&st, line_buf, sizeof(line_buf));
+                        ESP_LOGI(TAG, "电池: %s", line_buf);
+
+                        /*
+                         * 判读提示 —— 直接告诉用户"有没有电池"。
+                         *
+                         * 关键判据是【ADC 原始码】, 而不是换算后的电压:
+                         *   2696~3280  -> 有效电池电压区间 (官方分档表)
+                         *   4095       -> 满量程, ADC 没切到电池通道 / 分压上端悬空
+                         *   0          -> 输入被拉到地
+                         *   其他偏小值  -> 悬空引脚的杂散电压 (实测 250~310)
+                         */
+                        if (st.adc_raw >= 4090) {
+                            ESP_LOGW(TAG, "  => 满量程 (4095): 分压回路断开, "
+                                          "大概率没装电池或底板不带电池电路");
+                        } else if (st.adc_raw == 0) {
+                            ESP_LOGW(TAG, "  => 0V: 电池座空 / 接触不良 / 无电池电路");
+                        } else if (st.adc_raw >= 2400) {
+                            ESP_LOGI(TAG, "  => 电池已装且有电 (正常读数)");
+                        } else {
+                            ESP_LOGW(TAG, "  => ADC=%d 偏低 (有效区间是 2696~3280): "
+                                          "分压回路没接上, 大概率没装电池",
+                                     st.adc_raw);
+                        }
+                    }
+                } else if (strcmp(line, "batdiag") == 0) {
+                    /*
+                     * 电池电路深度诊断 —— 扫描各种控制脚组合。
+                     * 用来区分"没装电池"和"我们控制脚用错了"。
+                     */
+                    power_board_diagnose();
                 } else if (strcmp(line, "ispeed") == 0) {
                     i2c_speed_probe();
                 } else if (strcmp(line, "iprobe") == 0) {
@@ -5728,7 +5909,7 @@ static void uart_cmd_task(void *arg)
                     boot_button_simulate();
                 } else {
                     ESP_LOGW(TAG, "未知命令: %s", line);
-                    ESP_LOGW(TAG, "可用: lcd0/lcd1/lcd2/stat/q/hash/conv 0|1/pda 0|1/wifioff/wifix/astat/adcreg/tone/astop/vol N/mgain N/cgain N/scan/axtest/actest/lcdprompt/evtest");
+                    ESP_LOGW(TAG, "可用: lcd0/lcd1/lcd2/stat/q/hash/conv 0|1/pda 0|1/wifioff/wifix/astat/adcreg/tone/astop/vol N/mgain N/cgain N/scan/axtest/actest/lcdprompt/evtest/bat/batdiag/awregs");
                 }
                 len = 0;
             }
@@ -5792,6 +5973,49 @@ static bool aw_key_state(uint8_t pin)
  *   evtest              注入一条默认文案的事件
  *   evtest <自定义文案>  注入一条自定义文案的事件 (验证文案可配置)
  */
+/*
+ * 把一个看护事件同时送进推模式队列 (push_client)。
+ *
+ * 前置声明: 电源状态变化回调要用它。
+ */
+static void push_event_to_cloud(uint32_t seq, uint64_t ts_ms,
+                                const char *type, const char *msg);
+
+/*
+ * 【电源状态变化回调】—— 由 power_board 的后台监测任务调用。
+ *
+ * 触发时机:
+ *   - Type-C 插上 / 拔掉 (供电来源变化)
+ *   - 开始充电 / 停止充电
+ *
+ * 为什么值得单独推一条事件:
+ *   PRD R-05 "设备离线 > 10min" 告警的前提是【知道设备本来在线】。
+ *   如果设备被人拔了电, 那和"断网"是两回事, 子女端的处置完全不同
+ *   (断网 -> 检查路由器; 断电 -> 检查插座/电池)。这条事件就是给
+ *   后台区分这两者的依据。
+ */
+static void power_status_changed(const power_status_t *now,
+                                 const power_status_t *old)
+{
+    char msg[160];
+    uint64_t ts = (uint64_t)(esp_timer_get_time() / 1000);
+
+    const char *type = "power_source_changed";
+    if (old->charging != now->charging) {
+        type = now->charging ? "charging_started" : "charging_stopped";
+    }
+
+    snprintf(msg, sizeof(msg),
+             "供电方式%s, 充电%s, 电量%d%%",
+             (now->source == POWER_SOURCE_BATTERY) ? "切换为电池" : "切换为Type-C",
+             now->charging ? "中" : "停止",
+             now->percent);
+
+    ESP_LOGI(TAG, "电源状态变化: %s (%s)", type, msg);
+
+    push_event_to_cloud((uint32_t)ts, ts, type, msg);
+}
+
 /*
  * 把一个看护事件同时送进推模式队列 (push_client)。
  *
@@ -6272,6 +6496,10 @@ static void button_task(void *arg)
 
 /* ---------------- 主函数 ---------------- */
 
+/* 电源状态变化回调 (定义在文件后部, 供 app_main 注册) */
+static void power_status_changed(const power_status_t *now,
+                                 const power_status_t *old);
+
 void app_main(void)
 {
     printf("\n========================================\n");
@@ -6439,6 +6667,28 @@ void app_main(void)
 #endif
     } else {
         ESP_LOGW(TAG, "音频初始化失败，视频功能不受影响");
+    }
+
+    /*
+     * 电池 / 电源检测 (BOX3 底板 18650 电池座 + 充电电路)。
+     *
+     * 放在摄像头之后、Wi-Fi 之前:
+     *   - 需要 AW9523B 已经初始化好 (采样时序要操作 XIO2)
+     *   - ADC1_CH0 (GPIO1) 独占 ADC1, 不与摄像头/音频抢资源
+     *
+     * 作用: 让软件能区分"被人拔了电"和"正常充电中",
+     *       这是产品化断电告警 (PRD R-05) 的基础。
+     */
+    if (power_board_init() == ESP_OK) {
+        ESP_LOGI(TAG, "电源管理已就绪 (串口命令 bat 查看电量)");
+        /*
+         * 注册变化回调 —— 插拔 Type-C / 开始充电停止充电时,
+         * 自动推一条事件给子女端, 让他知道设备是"断电"还是"断网"。
+         */
+        power_board_set_change_cb(power_status_changed);
+        power_board_start_monitor();
+    } else {
+        ESP_LOGW(TAG, "电源管理初始化失败, 无法读取电池电量");
     }
 
 #if LCD_SELFTEST_ONLY

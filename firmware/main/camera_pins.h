@@ -21,6 +21,9 @@
 /* BOARD_I2C_PORT 用到 i2c_port_t / I2C_NUM_0, 需要 driver/i2c.h */
 #include "driver/i2c.h"
 
+/* BOARD_ADC_UNIT / BOARD_ADC_CHANNEL / BOARD_ADC_ATTEN 等 ADC 类型 */
+#include "esp_adc/adc_oneshot.h"
+
 /* ---- 摄像头 DVP 数据线 (GC0308) ---- */
 #define CAM_PIN_D0     7    /* GPIO_NUM_7  */
 #define CAM_PIN_D1     8    /* GPIO_NUM_8  */
@@ -119,6 +122,22 @@
  */
 #define XIO_KEY_K1           0   /* 板载按键 K1 (扩展器上, 低有效) */
 #define XIO_KEY_K2           1   /* 板载按键 K2 (扩展器上, 低有效) */
+/*
+ * 【电池电路】XIO2 / XIO3 —— 正点原子官方 config.h 里的定义, 之前漏掉了。
+ *
+ * 这两个脚是 BOX3 底板 18650 电池系统的一部分:
+ *   XIO2 = XIO_BAT_CHRG_EN  电池电压采样使能
+ *          拉低 -> 导通分压电阻, 把电池电压送到 ESP32 的 ADC 引脚;
+ *          读完后必须改回输入, 否则一直给电池分压 (白耗电 + 读数不准)。
+ *   XIO3 = XIO_BAT_CHRG     充电状态检测 (输入脚!)
+ *          低电平 = 正在充电, 高电平 = 没在充。
+ *
+ * 方向必须严格按官方来: XIO2 输出, XIO3 输入。
+ * 之前 power_outputs[] 数组里没有这两个脚, 而整条 P0 又被设成了推挽输出,
+ * 结果是 XIO3 被当作输出驱动 —— 这会短接充电检测电路, 读出来的状态是假的。
+ */
+#define XIO_BAT_CHRG_EN      2   /* 电池采样使能 (输出, 低=导通分压) */
+#define XIO_BAT_CHRG         3   /* 充电状态 (输入, 低=正在充电) */
 #define XIO_ESP_ADC_SEL      4   /* ADC 选择 */
 #define XIO_PA_CTRL          5   /* 音频功放使能 */
 #define XIO_LCD_BL           8   /* LCD 背光 —— 低电平点亮 (与官方一致, 勿改成高) */
@@ -129,6 +148,119 @@
 #define XIO_VDDA_3V3_EN     13   /* 音频 3.3V 电源使能 */
 #define XIO_CAM_2V8_EN      14   /* 摄像头 2.8V 供电使能 */
 #define XIO_CAM_RESET       15   /* 摄像头复位 */
+
+/* ---- 电池 ADC (正点原子官方 xiaozhi 固件同款配置) ----
+ *
+ * 官方 power_manager.h 用 ADC1_CH0 读电池电压:
+ *   - ADC_UNIT_1 / ADC_CHANNEL_0  -> GPIO1
+ *   - 12 dB 衰减 + 12 bit 位宽
+ *   - 读 10 次取平均
+ * GPIO1 在本项目的引脚表里没有被占用 (摄像头 D6=D4/D7=D5, 其余见上),
+ * 所以可以直接用。
+ */
+#define BOARD_ADC_UNIT        ADC_UNIT_1
+#define BOARD_ADC_CHANNEL     ADC_CHANNEL_0
+#define BOARD_ADC_ATTEN        ADC_ATTEN_DB_12
+#define BOARD_ADC_BITWIDTH    ADC_BITWIDTH_12
+
+/*
+ * 【关键发现 —— 实测标定, 不是照抄官方】
+ *
+ * 正点原子官方 xiaozhi 固件在 InitializeIoExpander() 里把 XIO_ESP_ADC_SEL
+ * 设成【高电平】, 而且官方自己把整个电池管理注释掉了
+ * (//InitializePowerManager();), 所以这段代码官方从未真正跑过。
+ *
+ * 我们实测 (batdiag 扫描 6 种组合) 的结果是:
+ *
+ *   EN(输出高) SEL(高) -> 4095  满量程, 无效
+ *   EN(输出低) SEL(高) -> 4095  满量程, 无效
+ *   EN(输出低) SEL(低) ->  374  有效
+ *   EN(输出高) SEL(低) ->  377  有效
+ *   EN(输入)   SEL(高) -> 4095  满量程, 无效
+ *   EN(输入)   SEL(低) ->  367  有效
+ *
+ * 结论: 决定性因素是 ADC_SEL, 必须【拉低】才能把 ADC 切到电池采样通道。
+ *       BAT_CHRG_EN 的方向/电平基本不影响读数 (367~377 都在同一量级)。
+ *
+ * 板载电源初始化里 ADC_SEL 保持高电平 (那是官方默认, 用于别的 ADC 源),
+ * 所以每次读电池电压前必须临时拉低, 读完再恢复。
+ */
+/*
+ * 【重要】这两个宏的值是【high 布尔值】, 不是"低=1"。
+ *
+ * aw9523b_set_level(port, addr, pin, high) 的第 4 个参数是 high:
+ *   true  -> 输出高电平
+ *   false -> 输出低电平
+ *
+ * 所以"拉低 ADC_SEL"必须写 false。之前这里写成 true, 结果每次"拉低"
+ * 实际都在拉高 -> ADC 读满量程 4095。这个 bug 极隐蔽: 逻辑看着对,
+ * 但读数永远不对, 还会让人误以为"板子上没电池"。
+ */
+#define BOARD_BAT_ADC_SEL_LOW   false  /* 读电池电压时 ADC_SEL 必须为低 */
+#define BOARD_BAT_ADC_SEL_HIGH  true   /* 恢复默认时 ADC_SEL 为高 */
+
+/*
+ * 电池电压 -> ADC 原始值 -> 百分比 的分档表 (官方原值, 别乱改)
+ *
+ *   ADC   2696 ->   0%   (3.48V, 再低就要闪屏了)
+ *   ADC   2724 ->  20%   (3.53V)
+ *   ADC   2861 ->  40%   (3.70V)
+ *   ADC   3038 ->  60%   (3.90V)
+ *   ADC   3150 ->  80%   (4.02V)
+ *   ADC   3280 -> 100%   (4.14V)
+ */
+#define BOARD_BAT_LEVELS \
+    { {2696, 0}, {2724, 20}, {2861, 40}, {3038, 60}, {3150, 80}, {3280, 100} }
+
+/* 官方低电保护阈值: ADC 低于此值 (且当前是电池供电) 就拉低 VDD_3V3_EN 关机 */
+#define BOARD_BAT_SHUTDOWN_ADC   2630
+
+/*
+ * 有效电池电压的下限。
+ *
+ * 低于这个值就认为"没有可用的电池电压":
+ *   - 悬空引脚实测约 250~260mV (换算后约 430mV), 没装电池时的杂散电压
+ *   - 真实 18650 即使放到最低也有 3.0V
+ * 取 2500mV 留足余量。
+ */
+#define BOARD_BAT_VALID_MIN_MV   2500
+
+/*
+ * 有效电池电压的【ADC 原始码】下限。
+ *
+ * 为什么用原始码而不是换算后的电压来判断有效性:
+ *   分压比是从官方代码反推的 (17/10), 还没经过万用表实测验证。
+ *   如果分压比猜错, 换算出的电压就是错的, 用它来判断有效性会
+ *   一错全错。原始码则直接对应硬件电路, 更可靠。
+ *
+ * 官方分档表: 最低有效值 2696 (对应 3.48V)。
+ * 留 10% 余量 -> 2400。
+ */
+#define BOARD_BAT_VALID_MIN_ADC  2400
+
+/* 采样时序: XIO2 拉低后要等分压稳定这么久 (官方写死 500ms) */
+#define BOARD_BAT_SETTLE_MS       500
+
+/*
+ * 电池分压比: 电池电压 = ADC 引脚电压 x (NUM / DEN)
+ *
+ * 【标定依据】用正点原子官方 xiaozhi 固件的分档表反推:
+ *   官方:  ADC 2696 -> 3.48V,  ADC 3280 -> 4.14V
+ *   ESP32-S3 在 12dB 衰减下满量程约 3.1V, 4095 码对应 3.1V
+ *   -> ADC 2696 码 = 2696/4095 x 3.1V = 2.04V  (引脚电压)
+ *   -> 分压比 = 3.48V / 2.04V = 1.70
+ *
+ * 所以 NUM/DEN = 17/10。
+ *
+ * 【注意】这个值是从官方代码反推的, 官方那版固件自己把电池管理注释掉了
+ * (//InitializePowerManager();), 从没实机验证过。
+ * 装上电池后如果读数偏差大, 用下面的方法实测标定:
+ *   1. 万用表量电池两端电压 Vbat
+ *   2. 串口执行 batdiag, 看 "引脚=XXXmV"
+ *   3. 分压比 = Vbat / 引脚电压, 换算成整数填回这里
+ */
+#define BOARD_BAT_DIVIDER_NUM     17
+#define BOARD_BAT_DIVIDER_DEN     10
 
 /* ---- 板载按键 ---- */
 #define BTN_BOOT_GPIO       0    /* BOOT 键 (GPIO0, 板载直连) */

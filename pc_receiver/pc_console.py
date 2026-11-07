@@ -125,6 +125,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <tr><td>音频链路</td><td><span class="tag g" id="tAudio">--</span></td></tr>
         <tr><td>活动检测</td><td><span class="tag g" id="tAct">--</span></td></tr>
         <tr><td>网络推送</td><td><span class="tag g" id="tPush">--</span></td></tr>
+        <tr><td>供电方式</td><td><span class="tag g" id="tPower">--</span></td></tr>
+        <tr><td>电池电量</td><td id="tBattery">--</td></tr>
         <tr><td>运行时长</td><td id="tUptime">--</td></tr>
       </table>
     </div>
@@ -193,7 +195,8 @@ async function pollHealth() {
   try {
     const h = await (await fetch('/api/health', {cache:'no-store'})).json();
     $('dot').className = 'dot on';
-    $('hdrInfo').textContent = '设备 ' + (h.ip || '-') + ' · RSSI ' + (h.rssi ?? '-') + "dBm";
+    $('hdrInfo').textContent = '设备 ' + (h.ip || '-') + ' · RSSI ' + (h.rssi ?? '-') + "dBm" +
+      (h.power_source ? ' · ' + (h.power_source === 'typec' ? 'Type-C供电' : '电池供电') : '');
 
     setTag($('tOnline'), h.camera_ok !== undefined, '在线', '异常');
     setTag($('tCam'), h.camera_ok === true, '正常', '故障');
@@ -202,9 +205,42 @@ async function pollHealth() {
     setTag($('tPush'), h.push_connected === true, '已连接', '未连接');
     $('tUptime').textContent = fmtDur(h.uptime);
 
+    /*
+     * 供电状态。
+     *
+     * 为什么单独显示:
+     *   "拔掉 Type-C 就没画面" 的根因是板子彻底断电 —— AW9523B 一死,
+     *   摄像头/音频/背光的电源轨全断, 屏幕必然全灭。
+     *   所以供电方式是判断"设备为什么没画面"的第一现场信息。
+     *
+     * 注意: 没装电池时, 板子的供电来源也会报成"电池"(充电芯片不会
+     *       拉低充电检测脚), 所以还要看 battery_valid 和电压。
+     */
+    const psrc = h.power_source || 'unknown';
+    if (psrc === 'typec') {
+      setTag($('tPower'), true, 'Type-C', '未知');
+    } else if (psrc === 'battery') {
+      setTag($('tPower'), true, '电池供电', '未知');
+    } else {
+      setTag($('tPower'), false, '未知', '未知');
+    }
+
+    if (h.battery_valid === true) {
+      const mv = h.battery_mv ?? 0;
+      const pct = h.battery_pct ?? 0;
+      $('tBattery').textContent = pct + '% (' + mv + 'mV)' +
+        (h.charging ? ' · 充电中' : '');
+      // 电量低于 20% 用醒目色, 方便一眼看出快没电了
+      $('tBattery').className = pct <= 20 ? 'warn' : '';
+    } else {
+      $('tBattery').textContent = '未读到（可能没装电池）';
+      $('tBattery').className = 'muted';
+    }
+
     const bad = !(h.camera_ok && h.audio_ready);
     const st = $('statusTitle');
     if (bad) { st.textContent = '设备异常'; st.className = 'big bad'; }
+    else if (psrc === 'battery') { st.textContent = '电池供电中'; st.className = 'big warn'; }
     else if (h.push_connected === false) { st.textContent = '设备正常，推送未连'; st.className = 'big warn'; }
     else { st.textContent = '无异常'; st.className = 'big ok'; }
   } catch (e) {
