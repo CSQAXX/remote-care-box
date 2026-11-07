@@ -323,12 +323,116 @@ setInterval(pollActivity, 5000);
 # --------------------------------------------------------------------------
 # 板子侧 HTTP 代理
 # --------------------------------------------------------------------------
-def fetch_bytes(device, path, timeout=10, port=None):
-    import urllib.request
+#
+# 【连接复用】为什么要自己写池, 不用 urllib
+#
+#   urllib 每次请求都新建 TCP 连接, 用完就 close -> 走的是 TIME_WAIT。
+#   控制台每 700ms 轮询一次事件、每 2s 一次健康检查, 再加上浏览器
+#   轮询, 短短几分钟就能在 PC 上堆出几百个 TIME_WAIT:
+#       TCP  192.168.2.135:49671  192.168.2.138:8081  TIME_WAIT
+#       TCP  192.168.2.135:49673  192.168.2.138:8081  TIME_WAIT
+#       ... 二十多个
+#   后果:
+#     1) 耗尽本机临时端口 (Windows 默认 16384, 也会被其它程序抢)
+#     2) 每次新建连接都要走三次握手, 徒增延迟
+#     3) 板子侧每个新连接都要分配 socket, 长连接一多就互相挤
+#
+#   http.client.HTTPConnection 支持 keep-alive, 响应读完不 close 就能
+#   复用同一条 TCP 连接。下面用线程本地池实现。
+import http.client
+import threading
+
+
+class _ConnPool:
+    """按 (host, port) 复用 keep-alive 连接。
+
+    【为什么是全局共享而不是线程本地】
+    控制台是 WSGI 多线程模型, 每个请求一个线程。如果连接池是线程本地的,
+    那么 N 个并发请求就会开 N 条 TCP 连接 —— 反而比每次新建更糟。
+    共享池 + 一把锁, 保证所有请求复用同一条连接。
+
+    实测: 板子的 IDF httpd 支持 HTTP/1.1 keep-alive (响应无
+    Connection: close), 同一条连接可以连续请求很多次。
+    """
+
+    def __init__(self):
+        self._conns = {}
+        self._lock = threading.RLock()
+
+    def _get_locked(self, host, port, timeout):
+        key = (host, port)
+        conn = self._conns.get(key)
+        if conn is not None:
+            try:
+                if conn.sock is None:
+                    conn = None
+            except Exception:
+                conn = None
+        if conn is None:
+            conn = http.client.HTTPConnection(host, port, timeout=timeout)
+            self._conns[key] = conn
+        return conn
+
+    def get_locked(self, host, port, timeout):
+        """调用方必须已持有 self.lock。"""
+        return self._get_locked(host, port, timeout)
+
+    def drop_locked(self, host, port):
+        """调用方必须已持有 self.lock。"""
+        conn = self._conns.pop((host, port), None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def get(self, host, port, timeout):
+        with self._lock:
+            return self._get_locked(host, port, timeout)
+
+    def drop(self, host, port):
+        with self._lock:
+            self.drop_locked(host, port)
+
+    @property
+    def lock(self):
+        return self._lock
+
+
+POOL = _ConnPool()
+
+
+def _request(device, path, method="GET", body=None, timeout=10, port=None):
+    """走 keep-alive 连接请求板子。失败自动重连一次。
+
+    整条请求在池锁内执行 —— 连接是共享的, 两个线程同时往同一条
+    TCP 连接写数据会交错, HTTP 响应就会串。
+    """
     port = port or DEVICE_PORT
-    url = f"http://{device}:{port}{path}"
-    with urllib.request.urlopen(url, timeout=timeout) as r:
-        return r.read()
+    with POOL.lock:
+        for attempt in (0, 1):
+            conn = POOL.get_locked(device, port, timeout)
+            try:
+                headers = {}
+                if body is not None:
+                    headers["Content-Type"] = "application/octet-stream"
+                    headers["Content-Length"] = str(len(body))
+                conn.request(method, path, body=body, headers=headers)
+                resp = conn.getresponse()
+                data = resp.read()
+                # 响应头里带 Connection: close 时必须丢弃这条连接
+                if resp.getheader("Connection", "").lower() == "close":
+                    POOL.drop_locked(device, port)
+                return data
+            except Exception:
+                POOL.drop_locked(device, port)
+                if attempt == 1:
+                    raise
+    raise RuntimeError("unreachable")
+
+
+def fetch_bytes(device, path, timeout=10, port=None):
+    return _request(device, path, "GET", None, timeout, port)
 
 
 def fetch_json(device, path, timeout=8, port=None):
@@ -573,12 +677,7 @@ def collect_mic_pcm(duration_ms=3000):
 
 def post_pcm(device, pcm):
     """对讲下行 -> 板子喇叭。走控制面端口, 与画面互不干扰。"""
-    import urllib.request
-    url = f"http://{device}:{CONTROL_PORT}/audio/down"
-    req = urllib.request.Request(url, data=pcm, method="POST",
-                                 headers={"Content-Type": "application/octet-stream"})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return r.read()
+    return _request(device, "/audio/down", "POST", pcm, 20, CONTROL_PORT)
 
 
 # --------------------------------------------------------------------------
@@ -651,12 +750,7 @@ def app(environ, start_response):
             n = int(environ.get("CONTENT_LENGTH") or 0)
             body = environ["wsgi.input"].read(n) if n else b""
             # 固件的 /notify 是 POST, 必须把 body 转发过去
-            import urllib.request
-            req = urllib.request.Request(
-                f"http://{device}:{CONTROL_PORT}/notify",
-                data=body or b"", method="POST")
-            with urllib.request.urlopen(req, timeout=5) as r:
-                r.read()
+            _request(device, "/notify", "POST", body or b"", 5, CONTROL_PORT)
             return json_resp({"ok": True})
         except Exception as e:
             return json_resp({"ok": False, "error": str(e)}, 502)
