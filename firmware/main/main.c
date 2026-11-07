@@ -3799,6 +3799,29 @@ static esp_err_t stream_handler(httpd_req_t *req)
         if (!slot_take_ready(s_jpg_slots, &idx, &jpg_len)) {
             /* 还没生产出新帧, 等等 */
             vTaskDelay(pdMS_TO_TICKS(20));
+
+            /*
+             * 【2026-11-06】等帧期间主动检查客户端是否已断开。
+             *
+             * 之前只在"发送失败"时才退出循环。但浏览器关掉标签页时
+             * 是【半关闭】(FIN_WAIT_2), 板子这边如果一直等帧不写数据,
+             * 就永远收不到 RST, socket 一直占着。
+             *
+             * 现场证据: 板子到 8080 的连接里堆了 3 个 FIN_WAIT_2,
+             * 数据面 /health 直接超时 —— 槽位被这些"已死但没释放"的
+             * 连接占着。浏览器每次刷新页面就多一个。
+             *
+             * 解决: 每隔一小段时间用 send 探测一次 (发 0 字节),
+             * TCP 会返回错误, 我们就能立刻感知断开并释放 socket。
+             */
+            static int idle_ticks = 0;
+            if (++idle_ticks >= 5) {   /* 每 100ms 探一次 */
+                idle_ticks = 0;
+                if (httpd_resp_send_chunk(req, NULL, 0) != ESP_OK) {
+                    ESP_LOGI(TAG, "画面客户端已断开 (空闲探测发现)");
+                    break;
+                }
+            }
             continue;
         }
 
