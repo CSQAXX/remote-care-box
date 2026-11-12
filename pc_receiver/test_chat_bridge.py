@@ -113,13 +113,26 @@ check("接口 /api/chat/status",
 
 _, body = call("/api/chat/start", "POST")
 d = json.loads(body.decode("utf-8"))
-# 没填 key 时必须明确拒绝并给出待补项，而不是悄悄起一个跑不通的线程
-check("无 key 时拒绝启动", d.get("ok") is False and bool(d.get("problems")),
-      "; ".join(d.get("problems", []))[:80])
+# 【2026-11-12】双后端语义改了:
+#   看护和小智是两个独立服务, 坏一个不该连累另一个。
+#   mode-aware 后端只在【两个都坏】时才拒绝启动。
+chat = pc.get_chat("127.0.0.1")
+if chat.brain.name == "mode-aware":
+    if chat.brain.check():
+        check("两个后端都坏时拒绝启动",
+              d.get("ok") is False and bool(d.get("problems")),
+              "; ".join(d.get("problems", []))[:80])
+    else:
+        check("有一个后端就绪时放行启动", d.get("ok") is True,
+              str(d.get("msg", ""))[:60])
+        call("/api/chat/stop", "POST")
+else:
+    check("双后端模式 (mode-aware)", False, "实际后端=%s" % chat.brain.name)
 
 _, body = call("/api/chat/say", "POST", "你好".encode("utf-8"))
 d = json.loads(body.decode("utf-8"))
-check("接口 /api/chat/say", d.get("ok") is False and bool(d.get("problems")))
+check("接口 /api/chat/say", "ok" in d,
+      "ok=%s msg=%s" % (d.get("ok"), str(d.get("msg", ""))[:40]))
 
 _, body = call("/api/chat/stop", "POST")
 d = json.loads(body.decode("utf-8"))

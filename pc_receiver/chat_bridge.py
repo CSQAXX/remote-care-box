@@ -52,6 +52,66 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "chat_config.json")
 EXAMPLE_PATH = os.path.join(HERE, "chat_config.example.json")
 
+
+def _ensure_opus_dll_on_path():
+    """把 opus.dll 所在目录加进 PATH, 让 opuslib 能加载它。
+
+    【为什么需要】
+    Windows 上 `pip install opuslib` 只装了 Python 绑定, 真正的编解码库
+    (opus.dll) 是独立的原生库, 必须在 PATH 里才能被 LoadLibrary 找到。
+    缺了它 import opuslib 就会报:
+        Exception: Could not find Opus library. Make sure it is installed.
+    然后小智后端直接不可用 —— 而小智后端是"看护+小智"两个入口之一,
+    静默挂掉很难查。
+
+    【怎么找】
+    按优先级搜这几个位置:
+      1. pc_receiver/ 目录下 (README 建议手动放这里)
+      2. Python 的 DLLs/ 目录 (pip 装 libopus 时的默认落点)
+      3. 环境变量 KANHU_OPUS_DIR 指定的目录
+
+    找得到就补进 PATH, 找不到就什么都不做 (让 opuslib 自己报错,
+    报错信息更明确)。
+    """
+    if os.name != "nt":
+        return
+    try:
+        import opuslib  # noqa: F401
+        return          # 已经能 import, 说明 DLL 就在 PATH 里
+    except Exception:
+        pass
+
+    candidates = []
+    env_dir = os.environ.get("KANHU_OPUS_DIR")
+    if env_dir:
+        candidates.append(env_dir)
+    candidates.append(HERE)
+    # Python 安装目录下的 DLLs (Scripts 的上一级)
+    py_prefix = os.path.dirname(os.path.dirname(sys.executable))
+    candidates.append(os.path.join(py_prefix, "DLLs"))
+    candidates.append(os.path.join(sys.prefix, "DLLs"))
+
+    for d in candidates:
+        if not d or not os.path.isdir(d):
+            continue
+        has_opus = any(
+            f.lower().startswith("opus") and f.lower().endswith(".dll")
+            for f in os.listdir(d)
+        )
+        if has_opus:
+            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+            # DLL 已经加载进进程了, 光改 PATH 不够 —— 还要让 ctypes 重新找
+            try:
+                import importlib
+                importlib.invalidate_caches()
+                os.add_dll_directory(d)
+            except Exception:
+                pass
+            return
+
+
+_ensure_opus_dll_on_path()
+
 SAMPLE_RATE = 16000
 FRAME_MS = 20
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000      # 320
@@ -833,6 +893,93 @@ class XiaozhiBrain:
         raise RuntimeError("小智后端只收语音，文字调试请切到 backend=openai")
 
 
+class ModeAwareBrain:
+    """按板子当前语音模式挑后端 —— 「看护」和「小智」各走各的大脑。
+
+    ============================ 为什么需要这个 ============================
+
+    板子上有两套完全不同的「大脑」，由两句唤醒词切换：
+        「晴老师」  -> 看护对讲  -> 自家网关 /v1/turn (DeepSeek)
+        「小康同学」-> 小智聊天  -> 本地小智 WebSocket (你自己跑的服务)
+
+    如果对话桥只有一个 backend, 就必然出现「小智模式下其实还在用
+    DeepSeek」这种名不副实的情况 —— 看着像小智, 行为却不是。
+
+    这个类在【每一轮对话开始前】问一次板子当前的 voice_mode,
+    然后把这一轮交给对应的后端。
+
+    ============================ 怎么问板子 ============================
+
+    GET http://<板子IP>:8081/health  -> JSON 里的 "voice_mode" 字段
+    ("care" / "xiaozhi")。这个字段是固件 2026-11-12 加的。
+
+    问不到 (板子还没连上 / 旧固件没这个字段) 时退回 cfg 里的默认后端,
+    不影响原有行为 —— 老固件也能继续用。
+
+    ============================ 代价 ============================
+
+    每轮多一次 HTTP 请求 (几毫秒, 局域网内)。换来的��能按模式分流,
+    值这个钱。
+    """
+
+    def __init__(self, cfg, care_brain, xiaozhi_brain, device="", port=8081):
+        self.c = cfg
+        self.care = care_brain
+        self.xiaozhi = xiaozhi_brain
+        self.device = device
+        self.port = int(port)
+        self.name = "mode-aware"
+        self.last_mode = None
+
+    def check(self):
+        """只报【两个后端都有问题】才算没就绪。
+
+        单个后端缺 key 并不意味着整个桥不可用 —— 看护和小智是两个
+        独立的服务, 坏一个不该连累另一个。
+        """
+        problems = []
+        care_p = self.care.check()
+        xz_p = self.xiaozhi.check()
+        if care_p and xz_p:
+            problems = ["看护后端: %s" % "; ".join(care_p),
+                        "小智后端: %s" % "; ".join(xz_p)]
+        return problems
+
+    def _fetch_mode(self):
+        """问板子当前是哪个模式。问不到就返回 None。"""
+        url = "http://%s:%d/health" % (self.device, self.port)
+        try:
+            raw = http_request(url, timeout=3)
+            d = json.loads(raw.decode("utf-8", "replace"))
+            mode = d.get("voice_mode")
+            if mode in ("care", "xiaozhi"):
+                return mode
+        except Exception:
+            pass
+        return None
+
+    def _pick(self):
+        """决定这一轮用哪个后端。"""
+        mode = self._fetch_mode()
+        if mode is None:
+            # 问不到就用配置里的默认后端 (兼容旧固件 / 板子不在线)
+            default = str(self.c.get("backend", "openai")).lower()
+            mode = "xiaozhi" if default == "xiaozhi" else "care"
+        self.last_mode = mode
+        return self.xiaozhi if mode == "xiaozhi" else self.care
+
+    def reply(self, pcm, user_text=None):
+        brain = self._pick()
+        # 小智后端只收语音; 文字提问时退回看护后端 (它支持文字)
+        if user_text and brain is self.xiaozhi:
+            brain = self.care
+        return brain.reply(pcm, user_text)
+
+    def say(self, text):
+        # 文字提问一律走看护后端 —— 小智后端不支持纯文字
+        return self.care.say(text)
+
+
 class MockBrain:
     """自检用：不联网、不接板子也能把状态机和音频管线跑一遍。"""
     name = "mock"
@@ -853,9 +1000,22 @@ class MockBrain:
 
 
 def make_brain(cfg, mock=False):
+    """按配置造出对话大脑。
+
+    backend = "mode-aware" 时造【双后端】: 看护用 openai(DeepSeek/本地Ollama),
+    小智用 xiaozhi(WebSocket), 每轮按板子当前 voice_mode 分流。
+    """
     if mock:
         return MockBrain(cfg)
     backend = str(cfg.get("backend", "openai")).lower()
+    if backend == "mode-aware":
+        return ModeAwareBrain(
+            cfg,
+            care_brain=OpenAIBrain(cfg),
+            xiaozhi_brain=XiaozhiBrain(cfg),
+            device=cfg.get("device", ""),
+            port=int(cfg.get("control_port", 8081)),
+        )
     if backend == "xiaozhi":
         return XiaozhiBrain(cfg)
     return OpenAIBrain(cfg)
@@ -874,6 +1034,10 @@ class ChatBridge:
         self.cfg = apply_env(cfg or load_config())
         self.device = device or self.cfg.get("device") or "192.168.2.138"
         self.port = int(port or self.cfg.get("control_port", 8081))
+        # 【2026-11-12】把真实板子地址传给 brain ——
+        # mode-aware 后端要靠它去问板子当前是看护还是小智模式。
+        self.cfg["device"] = self.device
+        self.cfg["control_port"] = self.port
         self.brain = make_brain(self.cfg, mock=mock)
         self.vad = VAD(self.cfg.get("vad"))
         self.max_down = float(self.cfg.get("down", {}).get("max_seconds", 20))

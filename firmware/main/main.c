@@ -4313,7 +4313,8 @@ static esp_err_t health_handler(httpd_req_t *req)
              "\"push_fails\":%u,\"push_backoff_ms\":%u,"
              "\"ai_state\":\"%s\",\"ai_connected\":%s,\"ai_turns\":%u,\"ai_replies\":%u,"
              "\"ai_errors\":%u,\"ai_last_user\":\"%s\",\"ai_last_reply\":\"%s\","
-             "\"wake_ready\":%s,\"wake_hits\":%u,\"wake_prob\":%.3f,\"wake_name\":\"%s\"}",
+             "\"wake_ready\":%s,\"wake_hits\":%u,\"wake_prob\":%.3f,"
+             "\"wake_name\":\"%s\",\"voice_mode\":\"%s\"}",
              IP2STR(&ip.ip),
              (unsigned long long)(esp_timer_get_time() / 1000),
              (uint32_t)s_frame_count,
@@ -4375,7 +4376,21 @@ static esp_err_t health_handler(httpd_req_t *req)
              wake_word_is_ready() ? "true" : "false",
              (unsigned)wake_word_hit_count(),
              (double)wake_word_last_prob(),
-             WAKE_WORD_NAME);
+             WAKE_WORD_NAME,
+             /*
+              * 【2026-11-12】voice_mode: 当前语音模式 ("care" / "xiaozhi")。
+              *
+              * 为什么必须告诉 PC 端:
+              *   板子上有【两套大脑】——
+              *     看护对讲  -> 自家网关 /v1/turn (DeepSeek)
+              *     小智聊天  -> 本地小智 WebSocket (你电脑上的服务)
+              *   PC 端的对话桥要按这个字段挑后端, 否则两边都用同一个,
+              *   "小智"就名不副实了。
+              *
+              * voice_mode_get() 顺手做一次空闲超时回退, 所以这里拿到的是
+              * 真正生效的模式。
+              */
+             voice_mode_get() == VOICE_MODE_XIAOZHI ? "xiaozhi" : "care");
 
     httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);

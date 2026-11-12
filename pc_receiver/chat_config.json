@@ -1,0 +1,54 @@
+{
+  "backend": "mode-aware",
+  "device": "",
+  "control_port": 8081,
+  "vad": {
+    "energy_threshold": 350,
+    "start_frames": 3,
+    "silence_ms": 700,
+    "min_speech_ms": 400,
+    "max_speech_ms": 12000,
+    "preroll_ms": 300
+  },
+  "asr": {
+    "provider": "openai",
+    "base_url": "https://api.siliconflow.cn/v1",
+    "api_key": "",
+    "model": "FunAudioLLM/SenseVoiceSmall",
+    "language": "zh",
+    "timeout": 30
+  },
+  "llm": {
+    "provider": "openai",
+    "base_url": "http://127.0.0.1:11434/v1",
+    "api_key": "ollama",
+    "model": "qwen3:14b",
+    "system_prompt": "你是「远程看护盒子」里的语音陪伴助手，正在陪一位独居老人聊天。说话要短、口语化、温和，一次回复不超过 60 个字，方便语音播出来听清。不要使用 Markdown、列表、括号说明或表情符号。不做医疗诊断；老人说身体不舒服、摔倒或需要帮助时，提醒他按盒子上的求助键，并告诉他已经通知家人。",
+    "max_tokens": 160,
+    "temperature": 0.7,
+    "history_turns": 6,
+    "timeout": 40
+  },
+  "tts": {
+    "provider": "auto",
+    "base_url": "",
+    "api_key": "",
+    "model": "",
+    "voice": "zh-CN-XiaoxiaoNeural",
+    "response_format": "wav",
+    "timeout": 40
+  },
+  "xiaozhi": {
+    "ota_url": "",
+    "ws_url": "ws://127.0.0.1:8000/xiaozhi/v1/",
+    "token": "",
+    "device_id": "kanhu-box-01",
+    "client_id": "kanhu-pc-bridge-01",
+    "downlink_rate": 24000,
+    "timeout": 40
+  },
+  "down": {
+    "max_seconds": 20,
+    "timeout": 90
+  }
+}
