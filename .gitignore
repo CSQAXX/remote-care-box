@@ -100,3 +100,7 @@ docs/chats/序号_*.md
 # ---- 局域网口令: 由 tools/enable_pc_voice.py 自动生成, 含 token, 不入库 ----
 /firmware/main/pc_voice_config.h
 /firmware/main/pc_voice_config.example.h
+
+# ---- sdkconfig 的临时备份 (改配置前留的底, 用完即弃) ----
+/firmware/sdkconfig.bak_*
+/firmware/sdkconfig.*.bak

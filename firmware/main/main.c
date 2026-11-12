@@ -81,6 +81,7 @@
 #include "ai_client.h"
 #include "wake_word.h"
 #include "voice_mode.h"
+#include "wifi_config.h"
 
 #include <math.h>
 
@@ -1342,25 +1343,34 @@ static void wifi_init(void)
     s_netif = esp_netif_create_default_wifi_sta();
 
     /*
+     * 【2026-11-12】SSID / 密码优先从 NVS 读, 读不到才用编译期默认值。
+     *
+     * 这样换网络 (换了校园网 / 路由器改名 / 换密码) 只要一条串口命令,
+     * 不用改源码重新烧录。见 wifi_config.c。
+     */
+    const char *ssid = wifi_config_ssid();
+    const char *pass = wifi_config_pass();
+
+    /*
      * 认证方式按密码是否为空自动选。
      * 之前固定 WPA_WPA2_PSK, 对 OPEN 网络 (2.4GHz 的 WMU-EDU) 会失败。
+     * 校园网经常是开放网络或 WPA2-Enterprise, 这里按密码有无自动切。
      */
     wifi_auth_mode_t authmode;
-    if (WIFI_PASSWORD[0] == '\0') {
+    if (pass[0] == '\0') {
         authmode = WIFI_AUTH_OPEN;
     } else {
         authmode = WIFI_AUTH_WPA_WPA2_PSK;
     }
 
-    wifi_config_t sta_cfg = {
-        .sta = {
-            .ssid     = WIFI_SSID,
-            .password = WIFI_PASSWORD,
-            .threshold.authmode = authmode,
-            /* 扫描时也用同一个认证方式, 否则扫不到企业网络的隐藏 SSID */
-            .scan_method = WIFI_ALL_CHANNEL_SCAN,
-        },
-    };
+    wifi_config_t sta_cfg = {0};
+    /* ssid/pass 是 const char*, 但 esp_wifi_set_config 要的是定长数组,
+     * 所以这里必须拷贝一份 (顺便截断到协议长度上限)。 */
+    strncpy((char *)sta_cfg.sta.ssid, ssid, sizeof(sta_cfg.sta.ssid) - 1);
+    strncpy((char *)sta_cfg.sta.password, pass, sizeof(sta_cfg.sta.password) - 1);
+    sta_cfg.sta.threshold.authmode = authmode;
+    /* 扫描时也用同一个认证方式, 否则扫不到企业网络的隐藏 SSID */
+    sta_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
     /*
      * 顺序很重要: 必须先 esp_wifi_set_mode() 再 esp_wifi_set_config()。
      *
@@ -1381,9 +1391,25 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "Wi-Fi STA 模式启动中 (SSID=%s, 认证=%s)",
-             WIFI_SSID,
-             authmode == WIFI_AUTH_OPEN ? "OPEN" : "WPA/WPA2");
+    /*
+     * 【2026-11-12】Wi-Fi 内存占用的说明。
+     *
+     * 内部 RAM 只剩 300 多字节时, 任务 TCB 全部分配失败
+     * ("任务 button_task 的 TCB 分配失败 (内部RAM)")。
+     *
+     * 内部 RAM 的大头已经定位到 httpd (已改成栈放 PSRAM, 见
+     * http_server_start 里的注释)。Wi-Fi 驱动这块, IDF 5.3 的
+     * wifi_sta_config_t 还没有 ampdu_rx_enable / ampdu_tx_enable
+     * 字段 (那是 5.4 才加的), 没法从配置层面关。
+     *
+     * 能做的是别让 Wi-Fi 疯狂重连 —— 每次 esp_wifi_connect() 都会
+     * 在内部 RAM 上分配扫描缓冲。退避逻辑在 wifi_event_handler 里。
+     */
+
+    ESP_LOGI(TAG, "Wi-Fi STA 模式启动中 (SSID=%s, 认证=%s, 来源=%s)",
+             ssid,
+             authmode == WIFI_AUTH_OPEN ? "OPEN" : "WPA/WPA2",
+             wifi_config_from_nvs() ? "NVS" : "编译期默认值");
 #endif
 }
 
@@ -4636,7 +4662,38 @@ static void http_server_start(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_PORT;
     config.max_uri_handlers = 16;
-    config.stack_size = 10240;
+
+    /*
+     * 【2026-11-12 修复"内部 RAM 耗尽 -> 所有任务建不起来"】
+     *
+     * 现场症状: 内部 RAM 只剩 303 字节, 于是
+     *     任务 button_task 的 TCB 分配失败 (内部RAM)
+     *     任务 cam_producer 的 TCB 分配失败 (内部RAM)
+     *     任务 uart_cmd 的 TCB 分配失败 (内部RAM)
+     * 连带 i2c 命令链也分配不出来, 最后 StoreProhibited 崩溃。
+     *
+     * 内存快照定位到的元凶:
+     *     [MEM] http_server_start 后  internal=17483   <- 之前
+     *     [MEM] 建完基础任务后        internal=303     <- 之后
+     * 也就是说 httpd 起来后内部 RAM 就只剩 17KB 了。
+     *
+     * 两个 httpd 实例的主任务栈都在【内部 RAM】:
+     *     主实例    stack_size = 10240
+     *     控制面    stack_size = 4096
+     * 合计 14KB —— 内部 RAM 只有 200 多 KB, 这一下就吃掉一大块。
+     *
+     * 修法:
+     *   1. task_caps 改成 MALLOC_CAP_SPIRAM —— httpd 任务栈挪到 PSRAM。
+     *      (IDF 5.3 的 httpd_config_t 就有这个字段, 默认是 INTERNAL)
+     *   2. 栈从 10240 降到 8192 —— /stream handler 只是读 JPEG 槽位
+     *      然后 chunked 发送, 8KB 绰绰有余。
+     *
+     * 为什么栈可以放 PSRAM: httpd 任务钉在 core 0 (config.core_id),
+     * 跟 cam_task 同核。ESP32-S3 的 PSRAM 缓存是【按核】维护的,
+     * 同核访问不会读到陈旧数据 —— 这也是为什么 httpd 必须钉 core 0。
+     */
+    config.task_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    config.stack_size = 8192;
     /*
      * 【2026-11-06 修复"板子 HTTP 全部 502"】
      *
@@ -4773,6 +4830,8 @@ static void httpd_control_start(void)
      * 所以至少要 12 留点余量。
      */
     config.max_uri_handlers = 12;
+    /* 【2026-11-12】栈也挪到 PSRAM, 理由同 http_server_start()。 */
+    config.task_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     config.stack_size = 4096;          /* 控制面 handler 很轻, 栈可以小 */
     config.max_open_sockets = 6;       /* 控制面: 短请求 + 音频长连接 */
     config.lru_purge_enable = true;
@@ -4846,6 +4905,30 @@ static void httpd_control_start(void)
     ESP_LOGI(TAG, "  控制面音频: /audio/alaw /audio/down /audio/level  (与画面互不干扰)");
 }
 
+/* ---------------- 内存快照 ---------------- */
+
+/*
+ * 打印内部 RAM 占用。
+ *
+ * 【为什么必须看内部 RAM 而不是 esp_get_free_heap_size()】
+ * 后者统计的是总堆 (含 8MB PSRAM), 永远看起来很充裕, 但内部 RAM
+ * 可能早就被吃光了 —— 任务 TCB 分配失败、i2c command link 分配失败
+ * 都是内部 RAM 耗尽的症状, 而总堆数字完全看不出问题。
+ *
+ * 【为什么用 printf 而不是 ESP_LOGI】
+ * 开机早期的日志会被后面密集的日志刷掉 (串口是 115200, 一秒能传几 KB),
+ * 内存快照恰恰发生在最早期, 用 ESP_LOGI 常常来不及看。
+ * printf 走的是另一个缓冲, 而且不受 log level 影响。
+ */
+static void mem_snapshot(const char *tag)
+{
+    printf("[MEM] %-22s internal=%u min=%u total=%u\n",
+           tag,
+           (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned int)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned int)esp_get_free_heap_size());
+}
+
 /* ---------------- 任务创建辅助 ---------------- */
 
 /*
@@ -4877,7 +4960,15 @@ static void task_start(void *fn, const char *name, uint32_t stack_bytes, UBaseTy
      */
     StaticTask_t *tcb = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (tcb == NULL) {
-        ESP_LOGE(TAG, "任务 %s 的 TCB 分配失败 (内部RAM)", name);
+        /*
+         * 内部 RAM 不够了。打印详细内存情况 —— 光说"失败"没法排查,
+         * 得知道还剩多少、是不是碎片化的。
+         */
+        ESP_LOGE(TAG, "任务 %s 的 TCB 分配失败 (内部RAM), 内部剩余=%u 最小剩余=%u 总堆剩余=%u",
+                 name,
+                 (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned int)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned int)esp_get_free_heap_size());
         heap_caps_free(stack);
         return;
     }
@@ -5758,6 +5849,112 @@ static void uart_cmd_task(void *arg)
                     audio_selftest_loop();
                 } else if (strcmp(line, "scan") == 0) {
                     wifi_scan_and_report();
+                } else if (strcmp(line, "wifishow") == 0) {
+                    /*
+                     * 看当前生效的 WiFi 配置。
+                     *
+                     * 密码不打印 —— 串口日志可能被录下来存进文档。
+                     */
+                    ESP_LOGI(TAG, "WiFi 配置: SSID=\"%s\" 认证=%s 来源=%s",
+                             wifi_config_ssid(),
+                             wifi_config_pass()[0] ? "WPA/WPA2" : "OPEN",
+                             wifi_config_from_nvs() ? "NVS (串口设过)" : "编译期默认值");
+                    ESP_LOGI(TAG, "  提示: wifiset <SSID> [密码]  改配置并重连");
+                    ESP_LOGI(TAG, "        wififorgot           忘掉 NVS 配置, 用默认值");
+                } else if (strncmp(line, "wifiset ", 8) == 0 ||
+                           strncmp(line, "wifisave ", 9) == 0) {
+                    /*
+                     * 设置 WiFi 配置并存进 NVS —— 换网不用重新烧固件。
+                     *
+                     *   wifiset <SSID> [密码]   设置 + 立即重连
+                     *   wifisave <SSID> [密码]  只保存, 不重连
+                     *
+                     * 密码省略 = 开放网络 (校园网常见)。
+                     * SSID 可以带空格, 所以从第一个空格之后全部当作 SSID,
+                     * 再往后的空格算密码分隔。
+                     */
+                    bool do_reconnect = (line[7] == 't');   /* "wifiset" 的第 8 个字符是 't' */
+                    const char *p = (line[7] == 't') ? line + 8 : line + 9;
+                    while (*p == ' ') p++;
+
+                    /* 拆成 SSID 和密码: 第一个空格分隔 */
+                    char ssid[64] = {0};
+                    char pass[80] = {0};
+                    const char *sp = strchr(p, ' ');
+                    if (sp) {
+                        size_t n = (size_t)(sp - p);
+                        if (n >= sizeof(ssid)) n = sizeof(ssid) - 1;
+                        memcpy(ssid, p, n);
+                        ssid[n] = '\0';
+                        const char *q = sp + 1;
+                        while (*q == ' ') q++;
+                        strncpy(pass, q, sizeof(pass) - 1);
+                    } else {
+                        strncpy(ssid, p, sizeof(ssid) - 1);
+                    }
+
+                    if (ssid[0] == '\0') {
+                        ESP_LOGE(TAG, "用法: wifiset <SSID> [密码]");
+                    } else {
+                        esp_err_t r = wifi_config_save(ssid, pass);
+                        if (r != ESP_OK) {
+                            ESP_LOGE(TAG, "保存失败: %s", esp_err_to_name(r));
+                        } else {
+                            ESP_LOGI(TAG, "已保存 SSID=\"%s\" (%s)",
+                                     ssid, pass[0] ? "有密码" : "开放网络");
+                            if (do_reconnect) {
+                                ESP_LOGI(TAG, "正在用新配置重连...");
+                                /*
+                                 * 不 esp_wifi_disconnect() —— 那个会触发
+                                 * WIFI_EVENT_STA_DISCONNECTED, 走重连退避逻辑。
+                                 * 直接 set_config + connect 最直接。
+                                 */
+                                esp_wifi_disconnect();
+                                wifi_config_t cfg = {0};
+                                strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
+                                if (pass[0]) {
+                                    strncpy((char *)cfg.sta.password, pass,
+                                            sizeof(cfg.sta.password) - 1);
+                                    cfg.sta.threshold.authmode = WIFI_AUTH_WPA_WPA2_PSK;
+                                } else {
+                                    cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+                                }                                cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+                                esp_wifi_set_config(WIFI_IF_STA, &cfg);
+                                esp_wifi_connect();
+                            }
+                        }
+                    }
+                } else if (strcmp(line, "wififorgot") == 0) {
+                    esp_err_t r = wifi_config_forget();
+                    if (r == ESP_OK) {
+                        ESP_LOGI(TAG, "已清除 NVS 配置, 重启后用编译期默认值 (SSID=\"%s\")",
+                                 WIFI_SSID);
+                    }
+                } else if (strcmp(line, "memstat") == 0) {
+                    /*
+                     * 内存分区统计 —— 定位"内部 RAM 被谁吃了"的主力工具。
+                     *
+                     * heap_caps_get_allocated_size 返回的是【已分配】的字节数,
+                     * 减一下总量就知道还剩多少。
+                     */
+                    const uint32_t cap_names[] = {
+                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT,
+                        MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL,
+                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
+                    };
+                    const char *cap_labels[] = {"内部RAM(8bit)", "内部RAM(DMA)", "PSRAM(8bit)"};
+                    for (int i = 0; i < 3; i++) {
+                        uint32_t total = heap_caps_get_total_size(cap_names[i]);
+                        uint32_t used  = heap_caps_get_allocated_size(cap_names[i]);
+                        uint32_t free  = heap_caps_get_free_size(cap_names[i]);
+                        uint32_t largest = heap_caps_get_largest_free_block(cap_names[i]);
+                        ESP_LOGI(TAG, "[内存] %-14s 总量=%" PRIu32 " 已用=%" PRIu32
+                                 " 剩余=%" PRIu32 " 最大块=%" PRIu32,
+                                 cap_labels[i], total, used, free, largest);
+                    }
+                    ESP_LOGI(TAG, "[内存] 任务数=%u  当前空闲栈=%u",
+                             (unsigned)uxTaskGetNumberOfTasks(),
+                             (unsigned)uxTaskGetStackHighWaterMark(NULL));
                 } else if (strcmp(line, "astat") == 0) {
                     audio_board_stats_t as;
                     if (audio_board_get_stats(&as) == 0) {
@@ -6651,6 +6848,17 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    mem_snapshot("nvs 初始化后");
+
+    /*
+     * 【2026-11-12】读 NVS 里存的 WiFi 配置 (换网不用重新烧固件)。
+     *
+     * 必须在 wifi_init() 之前调用 —— wifi_init 会用这里的值去
+     * esp_wifi_set_config()。读不到就退回编译期默认值, 不是错误。
+     */
+    if (!wifi_config_load()) {
+        ESP_LOGI(TAG, "使用编译期默认 WiFi 配置: SSID=\"%s\"", WIFI_SSID);
+    }
 
     s_event_queue = xQueueCreate(8, sizeof(button_event_t));
     if (s_event_queue == NULL) {
@@ -6658,8 +6866,15 @@ void app_main(void)
         return;
     }
 
-    ESP_LOGI(TAG, "PSRAM: %u bytes, 剩余堆: %u bytes",
+    /*
+     * 内存占用必须看【内部 RAM】, 不能看 esp_get_free_heap_size() ——
+     * 后者统计的是总堆 (含 8MB PSRAM), 看起来永远很充裕, 但内部 RAM
+     * 早就被吃光了 (任务 TCB 分配失败就是这么来的)。
+     */
+    ESP_LOGI(TAG, "PSRAM: %u bytes, 内部RAM剩余: %u bytes (最小 %u), 总堆剩余: %u",
              (unsigned int)esp_psram_get_size(),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned int)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
              (unsigned int)esp_get_free_heap_size());
 
     /* G.711 自检 —— 语音编码的量化逻辑写错了不会崩溃, 只会"听起来不对",
@@ -6687,6 +6902,7 @@ void app_main(void)
      */
     i2c_scan_once();
     task_start(i2c_monitor_task, "i2c_mon", 4096, 3);
+    mem_snapshot("I2C 初始化后");
 
     camera_power_reset();
 
@@ -6697,6 +6913,7 @@ void app_main(void)
 
     /* 屏幕: 背光已在 AW9523B 里打开, 这里初始化面板驱动 */
     bool lcd_ok = (lcd_init() == ESP_OK);
+    mem_snapshot("lcd_init 后");
     if (lcd_ok) {
         lcd_fill_screen(0x0000);      /* 先清黑，等摄像头画面 */
         ESP_LOGI(TAG, "屏幕已初始化，等待摄像头画面");
@@ -6745,6 +6962,7 @@ void app_main(void)
              SLOT_COUNT, (unsigned)JPEG_SLOT_BYTES);
 
     camera_init();
+    mem_snapshot("camera_init 后");
 #endif
 
     /*
@@ -6756,6 +6974,7 @@ void app_main(void)
     if (activity_detect_init() == ESP_OK) {
         ESP_LOGI(TAG, "活动检测已就绪 (GET /activity 查看状态)");
     }
+    mem_snapshot("活动检测后");
 
     /*
      * 屏幕提示层 (需求文档 §3.8)。
@@ -6773,6 +6992,7 @@ void app_main(void)
      */
     if (audio_board_init() == ESP_OK) {
         ESP_LOGI(TAG, "音频子系统就绪");
+        mem_snapshot("audio_board_init 后");
         /*
          * 开机自检: 播放 100ms 测试音 + 录 800ms 统计电平。
          * 这是启动健康检查 —— 如果 codec 没起来, 这里会打警告。
@@ -6791,6 +7011,7 @@ void app_main(void)
         if (audio_board_start_monitor() == ESP_OK) {
             ESP_LOGI(TAG, "录音监测已启动, 对着麦克风说话看 rms 变化");
         }
+        mem_snapshot("音频监测启动后");
 
 #if AUDIO_SELFTONE
         /*
@@ -6856,6 +7077,7 @@ void app_main(void)
      */
     if (wake_word_start() == ESP_OK) {
         ESP_LOGI(TAG, "唤醒词「%s」已就绪 (串口命令 wake 查看状态)", "晴老师");
+        mem_snapshot("wake_word_start 后");
         /*
          * 一套固件两种用法: 默认看护对讲, 喊「小康同学」切到小智。
          * 打一行状态, 开机日志里就能确认两句口令都注册上了。
@@ -7014,6 +7236,7 @@ void app_main(void)
      * 导致自环测试直接被编译掉了。
      */
     wifi_init();
+    mem_snapshot("wifi_init 后");
 #if WIFI_ENABLE
 #if WIFI_MODE_AP
     /* AP 模式: 热点起来就能用, IP 固定 192.168.4.1 */
@@ -7038,10 +7261,12 @@ void app_main(void)
         ESP_LOGE(TAG, "Wi-Fi 连接超时！请检查 camera_pins.h 里的 SSID/密码");
     }
 #endif
+    mem_snapshot("Wi-Fi 等待结束");
 #endif /* WIFI_ENABLE */
 
 #if WIFI_ENABLE
     http_server_start();
+    mem_snapshot("http_server_start 后");
 
     /*
      * 可靠性模块 (需求文档 §3.9)。
@@ -7094,6 +7319,7 @@ void app_main(void)
 #if WIFI_ENABLE && !WIFI_MODE_AP
     task_start(wifi_reconnect_task, "wifi_recon", 4096, 4);
 #endif
+    mem_snapshot("建完基础任务后");
 
 #if LCD_SELFTEST_ONLY == 0
     /*

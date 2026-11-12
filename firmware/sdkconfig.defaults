@@ -73,7 +73,26 @@ CONFIG_CODEC_DATA_ADC_SUPPORT=n
 # 关键: 强制用旧版 I2C 驱动 —— 我们的 I2C0 (SDA=3/SCL=2) 上已经装了
 # 旧版 driver/i2c.h 驱动 (摄像头 SCCB + AW9523B 共用), 新版 i2c_master
 # 和旧版不能同时初始化同一个端口, 否则启动时 abort。
+#
+# 【2026-11-12 实测踩坑】这条以前【根本没生效】!
+# 本地组件 components/esp_codec_dev/Kconfig 里给这个选项写了
+#     depends on ESP_IDF_VERSION >= 5.3
+# 而 Kconfig 的 depends on 只认布尔 symbol, 字符串比较不合法 ->
+# 选项永远不会出现在菜单里, sdkconfig 里被静默丢弃。
+# 已把那个假的 depends on 去掉 (见 Kconfig 里的注释)。
 CONFIG_CODEC_I2C_BACKWARD_COMPATIBLE=y
+
+# ---- 双保险: 跳过 IDF 的新旧 I2C 驱动冲突自检 ----
+# IDF 5.3 在启动时有个构造函数会检查"旧版 driver/i2c.h 和新版 i2c_master
+# 是不是同时链进来了", 是就直接 abort() -> 无限重启。
+#
+# 本工程【故意只用旧版驱动】(摄像头 SCCB + AW9523B + codec 共用 I2C0),
+# 但 esp_lcd / esp_codec_dev 这类 IDF 内置组件在 IDF 5.3 里会无条件把
+# 新版 esp_driver_i2c 链进来 —— 只是链进来, 运行时并不用。
+# 于是这个"链进来"就足以触发误报 abort。
+#
+# IDF 官方为这种"故意只用旧版"的情况提供了这个开关。
+CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y
 
 # ---- main 任务栈加大 ----
 # 关键: 默认 3584 字节。加入音频初始化 (esp_codec_dev -> ES8311/ES7210

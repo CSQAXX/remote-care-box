@@ -138,9 +138,9 @@ int reliability_heartbeat_to_json(char *buf, size_t buf_size, bool with_replay)
                      hb.rssi,
                      ip_str,
                      (unsigned long long)hb.uptime_ms,
-                     (unsigned)hb.free_heap,
-                     (unsigned)hb.free_psram,
-                     (unsigned)hb.psram_size,
+                     (unsigned)(uint32_t)hb.free_heap,
+                     (unsigned)(uint32_t)hb.free_psram,
+                     (unsigned)(uint32_t)hb.psram_size,
                      hb.time_synced ? "true" : "false",
                      (long long)hb.epoch_ms,
                      hb.wifi_connected ? "true" : "false",
@@ -379,12 +379,13 @@ static void reliability_task(void *arg)
             }
 
             ESP_LOGI(TAG,
-                     "心跳: rssi=%d ip=%s 空闲堆=%u PSRAM余=%u/%u 对时=%s 摄像头=%s 音频=%s 模式=%s",
-                     hb.rssi,
+                     "心跳: rssi=%d ip=%s 内部RAM=%u 总堆=%u PSRAM余=%u/%u 对时=%s 摄像头=%s 音频=%s 模式=%s",
+                     (unsigned)hb.rssi,
                      hb.ip,
-                     (unsigned)hb.free_heap,
-                     (unsigned)hb.free_psram,
-                     (unsigned)hb.psram_size,
+                     (unsigned)(uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)(uint32_t)hb.free_heap,
+                     (unsigned)(uint32_t)hb.free_psram,
+                     (unsigned)(uint32_t)hb.psram_size,
                      hb.time_synced ? "是" : "否",
                      hb.camera_ok ? "正常" : "失效",
                      hb.audio_ok ? "正常" : "失效",
@@ -393,16 +394,21 @@ static void reliability_task(void *arg)
             /*
              * 内存不足检查。
              *
+             * 【2026-11-12 修正】原来判断的是 hb.free_heap, 那是【总堆】
+             * (含 8MB PSRAM), 永远有三四百万字节, 永远不触发告警 ——
+             * 而实际上内部 RAM 早就只剩 303 字节, 任务全建不起来。
+             * 必须看 MALLOC_CAP_INTERNAL。
+             *
              * 内部堆紧张是这板子的常态 (历史只剩 28KB),
              * 所以阈值压得很低 —— 只有真的危险了才报。
              * 报太多会让子女习惯性忽略告警, 那比不报更糟。
              */
-            if (hb.free_heap < RELIABILITY_LOW_HEAP_BYTES) {
+            uint32_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+            if (free_internal < RELIABILITY_LOW_HEAP_BYTES) {
                 char detail[64];
-                snprintf(detail, sizeof(detail), "内部空闲堆仅 %u 字节", (unsigned)hb.free_heap);
+                snprintf(detail, sizeof(detail), "内部RAM仅剩 %u 字节", (unsigned)free_internal);
                 reliability_report_error("low_memory", detail);
-            }
-        }
+            }        }
 
         vTaskDelay(pdMS_TO_TICKS(1000));
     }

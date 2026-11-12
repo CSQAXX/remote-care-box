@@ -1,12 +1,28 @@
 menu "Audio Codec Device Configuration"
-   config ESP_IDF_VERSION
-       string
-       option env="ESP_IDF_VERSION"
+    config ESP_IDF_VERSION
+        string
+        option env="ESP_IDF_VERSION"
 
     config CODEC_I2C_BACKWARD_COMPATIBLE
         bool "Enable backward compatibility for the I2C driver (force use of the old i2c_driver above v5.3)"
         default n
-        depends on ESP_IDF_VERSION >= 5.3
+        # 【2026-11-12 修正】
+        #
+        # 原来这里写的是 "depends on ESP_IDF_VERSION >= 5.3"。
+        # ESP_IDF_VERSION 虽然在上面用 option env= 定义了, 但 Kconfig 的
+        # depends on 只认布尔型 symbol —— 字符串比较在 Kconfig 里是不合法的,
+        # 结果这个选项【永远不出现】在 menuconfig 里。
+        #
+        # 后果: 工程 sdkconfig.defaults 里的
+        #     CONFIG_CODEC_I2C_BACKWARD_COMPATIBLE=y
+        # 被 Kconfig 静默丢弃, codec 组件编译时走的是新版 i2c_master,
+        # 而我们工程其它地方 (摄像头 SCCB / AW9523B / 屏幕) 走的是旧版
+        # driver/i2c.h —— 两套驱动共存, 启动时 IDF 的构造函数直接 abort:
+        #     E i2c: CONFLICT! driver_ng is not allowed to be used with this old driver
+        #     -> 板子无限重启 (每次重启播一声开机自检音 = "一直嘀嘀嘀")
+        #
+        # 修法: 去掉那个假的 depends on, 让选项无条件可用。
+        # (本工程 ID >= 5.3, 旧版驱动始终存在, 无需按版本分支)
         help
             Enable this option for backward compatibility with the old I2C driver
 
