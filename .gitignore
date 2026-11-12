@@ -31,7 +31,11 @@ venv/
 .env
 *.local
 secrets/
-pc_receiver/chat_config.json     # 对话桥的大模型 API key，只提交 example 模板
+pc_receiver/chat_config.json
+# 注: gitignore 不支持行尾注释 —— 上一行原本写成
+# "pc_receiver/chat_config.json  # 对话桥的大模型 API key...",
+# 结果整行被当字面路径匹配, 规则完全失效, 配置文件会被提交进仓库。
+# 对话桥的大模型 API key, 只提交 example 模板。
 
 # 日志与临时
 *.log
