@@ -5064,6 +5064,30 @@ static void wifi_scan_and_report(void)
         }
     }
 
+    /*
+     * 【2026-11-12 修复"scan 永远失败"】
+     *
+     * 现象: 扫不到任何网络, 或者报
+     *     E kanhu: 扫描启动失败: ESP_ERR_WIFI_STATE
+     *
+     * 原因: ESP32 的 Wi-Fi 驱动【STA 正在连接/重连时不允许扫描】。
+     * 我们的固件是 STA 模式, 而且板子连不上网 -> 一直在退避重连,
+     * 刚好撞上扫描命令 -> ESP_ERR_WIFI_STATE。
+     *
+     * 修法: 扫描前先断开 STA (会触发一次 DISCONNECTED 事件, 走退避
+     * 重连逻辑, 那个逻辑本身是安全的), 再等驱动进入空闲态, 然后扫。
+     * 扫完不必马上重连 —— 重连任务会在退避计时到期后自动接上。
+     */
+    {
+        wifi_mode_t mode = WIFI_MODE_NULL;
+        if (esp_wifi_get_mode(&mode) == ESP_OK && mode == WIFI_MODE_STA) {
+            ESP_LOGI(TAG, "扫描前先断开 STA 连接 (驱动不允许边连边扫)");
+            esp_wifi_disconnect();
+            /* 等驱动从"连接中"退出来。给 500ms 余量。 */
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+    }
+
     wifi_scan_config_t scan_cfg = {
         .show_hidden = false,
         .scan_type   = WIFI_SCAN_TYPE_ACTIVE,
@@ -5099,9 +5123,11 @@ static void wifi_scan_and_report(void)
 
     ESP_LOGI(TAG, "扫描到 %u 个 2.4GHz 网络:", found);
 
-    /* ap_info_t 每个约 100 字节, 20 个就 2KB, 放堆上 */
+    /* ap_info_t 每个约 100 字节, 20 个就 2KB。
+     * 【2026-11-12】改放 PSRAM —— 内部 RAM 现在只剩 21KB, 经不起这种
+     * "临时诊断用的"分配。之前放内部 RAM, 扫一次网就把它榨干。 */
     wifi_ap_record_t *recs = heap_caps_malloc(found * sizeof(wifi_ap_record_t),
-                                              MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (recs == NULL) {
         ESP_LOGE(TAG, "扫描结果缓冲分配失败 (%u 字节)", (unsigned)(found * sizeof(wifi_ap_record_t)));
         return;
@@ -5944,13 +5970,16 @@ static void uart_cmd_task(void *arg)
                     };
                     const char *cap_labels[] = {"内部RAM(8bit)", "内部RAM(DMA)", "PSRAM(8bit)"};
                     for (int i = 0; i < 3; i++) {
-                        uint32_t total = heap_caps_get_total_size(cap_names[i]);
-                        uint32_t used  = heap_caps_get_allocated_size(cap_names[i]);
-                        uint32_t free  = heap_caps_get_free_size(cap_names[i]);
-                        uint32_t largest = heap_caps_get_largest_free_block(cap_names[i]);
+                        size_t total = heap_caps_get_total_size(cap_names[i]);
+                        size_t free  = heap_caps_get_free_size(cap_names[i]);
+                        size_t largest = heap_caps_get_largest_free_block(cap_names[i]);
+                        /* IDF 没有"按分区查已用"的接口, 用总量减剩余近似。
+                         * (碎片化会让这个数偏大, 够用了) */
+                        size_t used = (total > free) ? (total - free) : 0;
                         ESP_LOGI(TAG, "[内存] %-14s 总量=%" PRIu32 " 已用=%" PRIu32
                                  " 剩余=%" PRIu32 " 最大块=%" PRIu32,
-                                 cap_labels[i], total, used, free, largest);
+                                 cap_labels[i], (uint32_t)total, (uint32_t)used,
+                                 (uint32_t)free, (uint32_t)largest);
                     }
                     ESP_LOGI(TAG, "[内存] 任务数=%u  当前空闲栈=%u",
                              (unsigned)uxTaskGetNumberOfTasks(),
