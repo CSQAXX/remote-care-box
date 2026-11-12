@@ -56,6 +56,13 @@ typedef enum {
     PROMPT_WATCHING,       /* 「家人正在看画面」 */
     PROMPT_CALLING,        /* 「家人正在呼叫您」 */
     PROMPT_CONTENT,        /* 「该活动一下」等干预文案 */
+    /*
+     * 【小电脑模块专用】独立类型, 目的是和老人看护的提示彻底分开:
+     *   - 类型不同 -> 换提示时 lcd_prompt_show() 会先把旧横幅擦掉, 不会叠字
+     *   - 单独一套配色 (白底黑字), 不碰老人那边的黑底黄字
+     * 放在最后, 不影响前面已有的取值。
+     */
+    PROMPT_PC,
 } prompt_type_t;
 
 /* ---- 提示持续时间 (ms) ---- */
@@ -78,6 +85,18 @@ esp_err_t lcd_prompt_start(void);
  * @param duration_ms  显示时长 (0 = 用该类型的默认时长)
  */
 void lcd_prompt_show(prompt_type_t type, const char *text, uint32_t duration_ms);
+
+/**
+ * @brief 同 lcd_prompt_show(), 但可以指定前景/背景色
+ *
+ * 老人看护那套仍然走 lcd_prompt_show() (黑底黄字), 不受影响。
+ * 新模块想换配色时用这个, 不要去改 lcd_prompt.c 里的默认常量。
+ *
+ * @param fg  文字色 (RGB565)。按原值使用 —— 0x0000 就是黑字, 不会被当成"没指定"
+ * @param bg  背景色 (RGB565)。黑底传 0x0000, 白底传 0xFFFF
+ */
+void lcd_prompt_show_styled(prompt_type_t type, const char *text,
+                            uint32_t duration_ms, uint16_t fg, uint16_t bg);
 
 /**
  * @brief 立刻撤掉当前提示

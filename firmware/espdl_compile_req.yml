@@ -1,0 +1,103 @@
+# ============================================================================
+# esp-dl 算子/内核补充清单 (2026-11-08 实测踩坑后新增)
+# ----------------------------------------------------------------------------
+# 【为什么需要这个文件】
+#
+# esp-dl 采用"按需裁剪"策略: 每个模型组件通过 esp_dl_compile_add_yml()
+# 声明自己需要的算子和 Conv 内核, esp-dl 就只编译这些。
+# 多个模型组件共用同一个 esp-dl 实例时, 所有 yml 会被【合并】(APPEND),
+# 缺一个算子 -> 那个模型反序列化时 module_creator->create() 返回 NULL
+# -> m_model 为空 -> 第一次推理直接 LoadProhibited 崩。
+#
+# 【本工程踩到的具体坑】
+#
+# esp-sr (唤醒词 mn7_cn) 注册了 esp-sr-req.yml, 里面只有 10 个算子:
+#     Add / AveragePool / Conv / GRU / LUT / LpNormalization / Mul
+#     RMSNormalization / RequantizeLinear / Split / StreamingCache
+#
+# 而 pedestrian_detect (人形检测 pico_s8_v1) 的模型实际还需要:
+#     Concat / GlobalAveragePool / Relu / Resize / Sigmoid
+#
+# esp-sr 没声明这些, pedestrian_detect 自己又没注册任何 yml,
+# 于是 GlobalAveragePool 没被编译, 运行时报:
+#     E dl::Model: Do not support GlobalAveragePool, please implement and register it first.
+#     E dl::Model: There's no input in model.
+#     Guru Meditation Error: LoadProhibited  EXCVADDR: 0x00000014
+#     -> 板子无限重启 (每次重启播一声开机自检音, 听起来就是"一直嘀嘀嘀")
+#
+# 【怎么修的】
+#
+# 把缺的算子和对应内核补进本文件, 在顶层 CMakeLists.txt 里注册:
+#     esp_dl_compile_add_yml(${CMAKE_CURRENT_LIST_DIR}/espdl_compile_req.yml)
+#
+# esp-dl 的 register_module() 是按名字注册的, 同一个算子被两个 yml 声明
+# 也没关系 (register 是幂等的), 所以【追加】是安全的。
+#
+# 【以后要加新模型时】
+#
+# 1. 先跑一遍模型, 如果日志出现 "Do not support XXX",
+#    说明这个算子没编进来 -> 到这里把 XXX 加上
+# 2. 加完必须重新 idf.py build (算子集是编译期决定的, 不是运行期)
+# 3. Conv 内核也要一起加: 少了内核的话 Conv 会打印
+#    "no Conv kernel for packed key" 并且输出全空
+# ============================================================================
+
+kernel_abi: 1
+
+ops:
+  # ---- esp-sr (唤醒词) 已经有了, 这里只列缺的 ----
+  # Add
+  # AveragePool
+  # Conv
+  # GRU
+  # LUT
+  # LpNormalization
+  # Mul
+  # RMSNormalization
+  # RequantizeLinear
+  # Split
+  # StreamingCache
+
+  # ---- pedestrian_detect (人形检测 pico_s8_v1) 需要的 ----
+  - Concat
+  - GlobalAveragePool
+  - Relu
+  - Resize
+  - Sigmoid
+
+kernels:
+  # ---- esp-sr (唤醒词 mn7_cn) 已经有了, 这里只列缺的 ----
+  # dl_c_s16_conv2d_11cn
+  # dl_c_s16_depthwise_conv2d_hwc1
+  # dl_c_s16_tail_bias_linear
+  # dl_c_s16_tail_linear
+  # dl_c_w8a16_conv2d_11cn
+  # dl_esp32p4_s16_conv2d_per_channel_11cn
+  # dl_esp32p4_s16_conv2d_per_channel_11cn_bias
+  # dl_esp32p4_s16_depthwise_conv2d_per_channel_hwc1_bias
+  # dl_esp32p4_s16_unaligned_conv2d_per_channel_11cn
+  # dl_esp32p4_w8a16_conv2d_per_channel_11cn_bias
+  # dl_esp32p4_w8a16_conv2d_per_channel_11cn
+  # dl_tie728_s16_conv2d_11cn
+  # dl_tie728_s16_conv2d_11cn_bias
+  # dl_tie728_s16_depthwise_conv2d_per_channel_hwc1_bias
+  # dl_tie728_s16_unaligned_conv2d_per_channel_11cn
+  # dl_tie728_w8a16_conv2d_11cn_bias
+  # dl_tie728_w8a16_conv2d_11cn
+
+  # ---- pedestrian_detect (pico_s8_v1, s8 量化) 需要的 ----
+  # s8 1x1 conv (含 bias/relu 变体) —— 主干网络大部分卷积
+  - dl_tie728_s8_conv2d_11cn
+  - dl_tie728_s8_conv2d_11cn_relu
+  - dl_tie728_s8_unaligned_conv2d_11cn
+  # s8 3x3 conv
+  - dl_tie728_s8_conv2d_33cn
+  - dl_tie728_s8_conv2d_33cn_relu
+  - dl_tie728_s8_unaligned_conv2d_33cn
+  # s8 depthwise conv (分组卷积)
+  - dl_tie728_s8_depthwise_conv2d_33c1
+  - dl_tie728_s8_depthwise_conv2d_33c1_relu
+  - dl_tie728_s8_unaligned_depthwise_conv2d_33c1
+  - dl_tie728_s8_depthwise_conv2d_hwc1
+  - dl_tie728_s8_depthwise_conv2d_hwc1_relu
+  - dl_tie728_s8_unaligned_depthwise_conv2d_hwc1

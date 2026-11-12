@@ -1,0 +1,68 @@
+# 养老盒子 · AI 网关 —— 完全隔离的独立 compose 项目
+#
+# 【隔离红线】本项目与 /jiuzuo/ 零交集:
+#   - 独立 compose 项目名 (kanhu-ai), 不加入 /jiuzuo/docker-compose.yml
+#   - 独立端口: 网关 18000, Mongo 127.0.0.1:27018 (宿主机 27017 是 jiuzuo-mongo)
+#   - 独立数据卷, 全部落在 /kanhu-ai/data/ 下
+#   - 不写 /jiuzuo/ , 不写 /datajiuzuo/ , 不动现有任何容器
+#
+# 启动:  docker compose -p kanhu-ai up -d
+# 日志:  docker compose -p kanhu-ai logs -f gateway
+#
+# 【镜像源说明】服务器 /etc/docker/daemon.json 里的全局加速器已失效
+#   (docker.mirrors.ustc.edu.cn 域名都解析不了), 但直连 docker.io 也不通。
+#   实测可用且速度可接受: docker.1ms.run / docker.m.daocloud.io
+#   (1ms.run 实测明显更快, daocloud 拉 python 基础镜像卡了 10 分钟没完成)。
+#   这里【不修改全局 daemon.json】 —— 那会影响 jiuzuo 等现有服务的拉取行为,
+#   只在本项目里给镜像名加前缀, 影响范围最小。
+services:
+  mongo:
+    image: docker.1ms.run/library/mongo:6
+    container_name: kanhu-ai-mongo
+    restart: always
+    environment:
+      - TZ=Asia/Shanghai
+    # 只绑本机回环, 不对外暴露 —— 宿主机已有的 27017 是 jiuzuo-mongo, 不能冲突
+    ports:
+      - "127.0.0.1:27018:27017"
+    volumes:
+      - ./data/mongo:/var/lib/mysql
+    networks:
+      - kanhu_net
+
+  gateway:
+    build: .
+    container_name: kanhu-ai-gateway
+    restart: always
+    depends_on:
+      - mongo
+    environment:
+      - TZ=Asia/Shanghai
+      - KANHU_HOST=0.0.0.0
+      - KANHU_PORT=18000
+      - KANHU_ASR_BASE_URL=${KANHU_ASR_BASE_URL:-https://api.siliconflow.cn/v1}
+      - KANHU_ASR_API_KEY=${KANHU_ASR_API_KEY:-}
+      - KANHU_ASR_MODEL=${KANHU_ASR_MODEL:-FunAudioLLM/SenseVoiceSmall}
+      - KANHU_LLM_BASE_URL=${KANHU_LLM_BASE_URL:-https://api.deepseek.com/v1}
+      - KANHU_LLM_API_KEY=${KANHU_LLM_API_KEY:-}
+      - KANHU_LLM_MODEL=${KANHU_LLM_MODEL:-deepseek-chat}
+      - KANHU_TTS_PROVIDER=${KANHU_TTS_PROVIDER:-edge}
+      - KANHU_TTS_VOICE=${KANHU_TTS_VOICE:-zh-CN-XiaoxiaoNeural}
+      - KANHU_TTS_BASE_URL=${KANHU_TTS_BASE_URL:-}
+      - KANHU_TTS_API_KEY=${KANHU_TTS_API_KEY:-}
+      - KANHU_TTS_MODEL=${KANHU_TTS_MODEL:-}
+      - KANHU_DEVICES=${KANHU_DEVICES:-}
+      - KANHU_MONGO_URI=mongodb://mongo:27017
+      - KANHU_MONGO_DB=kanhu
+    ports:
+      # 对外只开 18000。Mongo 只绑回环。
+      - "18000:18000"
+    volumes:
+      - ./data/devices.txt:/kanhu-ai/data/devices.txt:ro
+    networks:
+      - kanhu_net
+
+networks:
+  kanhu_net:
+    name: kanhu_ai_net
+    driver: bridge

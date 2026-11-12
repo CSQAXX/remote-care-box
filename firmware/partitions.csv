@@ -3,3 +3,17 @@ nvs,      data, nvs,     0x9000,   0x5000,
 otadata,  data, ota,     0xe000,   0x2000,
 phy_init, data, phy,     0x10000,  0x1000,
 factory,  app,  factory, 0x20000,  0x300000,
+# ---------------------------------------------------------------------------
+# model 分区 —— esp-sr (MultiNet7 中文模型 mn7_cn) 的模型存放区
+#
+# 名字必须是 "model" (esp-sr 的 CMakeLists 按 --partition-name model 查),
+# 类型用 data/spiffs (esp-sr 用 esptool 按 spiffs 分区写 srmodels.bin)。
+#
+# 布局推算 (16MB Flash):
+#   factory 0x20000 + 0x300000 = 0x320000  (结束)
+#   model   0x320000 + 0x400000 = 0x720000  (结束)
+#   剩余   0x720000..0x1000000 = 8.9MB 留给 OTA / 后续扩展
+#
+# 4MB 够放: mn7_cn 2.6MB + FST + 其它可选模型
+# ---------------------------------------------------------------------------
+model,     data, spiffs,  0x320000, 0x400000,

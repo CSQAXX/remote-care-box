@@ -1,0 +1,13 @@
+# 养老盒子 · AI 网关依赖
+#
+# 刻意不用 torch / transformers / funasr:
+#   完整小智服务端要 torch 2.2.2 + SenseVoice 权重, 这台生产机只有
+#   3.6GB 内存 / 7.4GB 剩余磁盘, 跑不动。这里只做协议转换 + 转发,
+#   所有模型走云 API, 本地零权重。
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pymongo==4.10.1
+requests==2.32.3
+edge-tts==7.0.0
+pydub==0.25.1

@@ -62,10 +62,12 @@ static const char *TAG = "prompt";
 typedef struct {
     volatile bool      active;
     volatile prompt_type_t type;
-    char               text[64];
+    char               text[128];    /* 两行字幕最多 34 个汉字 (UTF-8 3 字节/字) */
     uint32_t           duration_ms;
     int64_t            show_ms;      /* 显示起始时间 */
     int64_t            hide_ms;      /* 到期擦除时间 */
+    uint16_t           fg;           /* 本条提示的文字色 */
+    uint16_t           bg;           /* 本条提示的背景色 */
     bool               dirty;        /* 需要重画 */
     bool               need_erase;   /* 需要擦除 */
     SemaphoreHandle_t  mutex;
@@ -104,6 +106,21 @@ static uint32_t prompt_default_duration(prompt_type_t type)
 
 void lcd_prompt_show(prompt_type_t type, const char *text, uint32_t duration_ms)
 {
+    /*
+     * 老人看护的默认外观: 黑底黄字 (求助类红字) —— 和以前完全一致。
+     * 颜色在这里就定好再往下传, 这样下面 prompt_task 只管照用,
+     * 不会把调用方明确指定的黑色 (0x0000) 误判成"没指定"。
+     */
+    uint16_t fg = PROMPT_FG_COLOR;
+    if (type == PROMPT_HELP_SENT || type == PROMPT_HELP_CANCELED) {
+        fg = PROMPT_FG_ALERT;
+    }
+    lcd_prompt_show_styled(type, text, duration_ms, fg, PROMPT_BG_COLOR);
+}
+
+void lcd_prompt_show_styled(prompt_type_t type, const char *text,
+                            uint32_t duration_ms, uint16_t fg, uint16_t bg)
+{
     if (type == PROMPT_NONE) {
         return;
     }
@@ -127,6 +144,8 @@ void lcd_prompt_show(prompt_type_t type, const char *text, uint32_t duration_ms)
     s_prompt.type     = type;
     snprintf(s_prompt.text, sizeof(s_prompt.text), "%s", msg);
     s_prompt.duration_ms = duration_ms;
+    s_prompt.fg       = fg;
+    s_prompt.bg       = bg;
     s_prompt.show_ms  = esp_timer_get_time() / 1000;
     s_prompt.hide_ms  = s_prompt.show_ms + duration_ms;
     s_prompt.active   = true;
@@ -172,14 +191,46 @@ prompt_type_t lcd_prompt_current_type(void)
  * 提示期间摄像头直绘会被暂停 (见 main.c 的 lcd_draw_owner 机制),
  * 所以横幅不会和画面打架。
  */
-static void draw_banner(const char *text, uint16_t fg)
+static void draw_banner(const char *text, uint16_t fg, uint16_t bg)
 {
-    /* 1) 遮住横幅区域 */
-    lcd_fill_rect(0, PROMPT_BANNER_Y, 320, PROMPT_BANNER_H, PROMPT_BG_COLOR);
+    /* 1) 铺背景 (老人是黑, 小电脑是白) */
+    lcd_fill_rect(0, PROMPT_BANNER_Y, 320, PROMPT_BANNER_H, bg);
 
-    /* 2) 画文字 (居中) */
-    lcd_draw_text_centered(0, PROMPT_BANNER_Y, 320, PROMPT_BANNER_H,
-                           text, fg, PROMPT_BG_COLOR, 1);
+    /*
+     * 2) 非黑底时, 顶端加一条浅灰分隔线。
+     *    白底横幅和上方画面之间没有分界会糊成一片, 加 1 像素就够了。
+     *    黑底不加 —— 保持老人那边原来的样子。
+     */
+    if (bg != PROMPT_BG_COLOR) {
+        lcd_fill_rect(0, PROMPT_BANNER_Y, 320, 1, 0xC618);
+    }
+
+    /*
+     * 3) 画文字。
+     *
+     * 文案里允许有一个 '\n' 表示换两行: 横幅 40 像素正好放两行 16px 字,
+     * 小电脑的长回话靠这个才不会被截断。
+     * 没有换行符就照旧单行居中 —— 老人看护那些文案都不带换行, 行为不变。
+     */
+    const char *nl = strchr(text, '\n');
+    if (nl == NULL) {
+        lcd_draw_text_centered(0, PROMPT_BANNER_Y, 320, PROMPT_BANNER_H,
+                               text, fg, bg, 1);
+        return;
+    }
+
+    /* 两行: 各占一半高度 (20px), 字高 16px, 每行上下各留 2px */
+    int half = PROMPT_BANNER_H / 2;
+    char first[64];
+    int n = (int)(nl - text);
+    if (n > (int)sizeof(first) - 1) {
+        n = (int)sizeof(first) - 1;
+    }
+    memcpy(first, text, (size_t)n);
+    first[n] = '\0';
+
+    lcd_draw_text_centered(0, PROMPT_BANNER_Y, 320, half, first, fg, bg, 1);
+    lcd_draw_text_centered(0, PROMPT_BANNER_Y + half, 320, half, nl + 1, fg, bg, 1);
 }
 
 /* ---------------- 提示任务 ---------------- */
@@ -192,7 +243,9 @@ static void prompt_task(void *arg)
         bool do_draw = false;
         bool do_erase = false;
         prompt_type_t type = PROMPT_NONE;
-        char text[64];
+        uint16_t draw_fg = 0;
+        uint16_t draw_bg = PROMPT_BG_COLOR;
+        char text[128];
 
         if (s_prompt.mutex) {
             xSemaphoreTake(s_prompt.mutex, portMAX_DELAY);
@@ -209,6 +262,8 @@ static void prompt_task(void *arg)
             s_prompt.dirty = false;
             do_draw = true;
             type = s_prompt.type;
+            draw_fg = s_prompt.fg;
+            draw_bg = s_prompt.bg;
             snprintf(text, sizeof(text), "%s", s_prompt.text);
         }
 
@@ -243,10 +298,12 @@ static void prompt_task(void *arg)
         }
 
         if (do_draw) {
-            uint16_t fg = PROMPT_FG_COLOR;
-            if (type == PROMPT_HELP_SENT || type == PROMPT_HELP_CANCELED) {
-                fg = PROMPT_FG_ALERT;
-            }
+            /*
+             * 颜色在 lcd_prompt_show() / lcd_prompt_show_styled() 里就已经定好,
+             * 这里必须【照用】, 不能再"判断 0 就换默认色" ——
+             * 黑字就是 0x0000, 那样会被误判成没指定, 白底上变成黄字看不见。
+             */
+            uint16_t fg = draw_fg;
 
             /*
              * 先通知画面层暂停直绘, 再画横幅。
@@ -255,7 +312,10 @@ static void prompt_task(void *arg)
             extern void lcd_view_pause(void);
             lcd_view_pause();
 
-            draw_banner(text, fg);
+            /* 打出来才能确认配色真的传对了 (白底黑字 = bg 0xFFFF / fg 0x0000) */
+            ESP_LOGI(TAG, "画横幅 fg=0x%04X bg=0x%04X", fg, draw_bg);
+
+            draw_banner(text, fg, draw_bg);
             banner_shown = true;
         }
 

@@ -31,6 +31,7 @@ venv/
 .env
 *.local
 secrets/
+pc_receiver/chat_config.json     # 对话桥的大模型 API key，只提交 example 模板
 
 # 日志与临时
 *.log
@@ -51,17 +52,51 @@ firmware/mjpeg_dump/
 
 # ---- 排障期临时探查脚本 (前缀下划线, 用完即弃) ----
 tools/_*.py
-firmware/main/_patch*.py
-
-# ---- 排障期根目录临时日志 (已归档进 firmware/tools_diag/) ----
-/t1.txt
-/stat_out.txt
-/iprobe*.txt
-/i2cdump*.txt
-/lcd_boot.txt
-/boot*.log
-/cold_boot.log
 
 # ---- 聊天记录归档: 无关项目的会话体积大, 不入库 ----
 docs/chats/C_Users_*.md
 docs/chats/序号_*.md
+
+# ============================================================
+# 2026-11-12 备份整理: 排障期的一次性产物
+# ============================================================
+
+# 抓取/探查日志 (串口抓包、i2c 探测、状态快照)
+/boot3.txt
+/boot_new.txt
+/disc3.txt
+/disc_log.txt
+/i2cdump*.txt
+/iprobe*.txt
+/lcd_boot.txt
+/stat_out*.txt
+/state_now.txt
+/t1.txt
+/talk_err.txt
+/firmware/build_out.txt
+
+# 音频测试录出来的波形
+/audio_e2e.wav
+
+# 反汇编/重定位中间产物 (分析 esp-sr 用, 可随时重新生成)
+/firmware/mn7_disasm.txt
+/firmware/mn7_reloc.txt
+
+# 反汇编出来的 .obj 副本
+/firmware/_mnextract/
+
+# 串口探查输出目录
+/firmware/output/
+
+# 打补丁时的一次性脚本 (前缀下划线)
+/firmware/main/_patch*.py
+
+# 改字体前的备份
+/firmware/main/*.bak_before_extra
+
+# pc_voice 改动前的自动备份目录
+/firmware/pc_voice_backup_*/
+
+# ---- 局域网口令: 由 tools/enable_pc_voice.py 自动生成, 含 token, 不入库 ----
+/firmware/main/pc_voice_config.h
+/firmware/main/pc_voice_config.example.h

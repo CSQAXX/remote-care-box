@@ -12,21 +12,34 @@ python pc_console.py --device 192.168.2.138 --port 8899
 
 ---
 
-## 1. 界面三块
+## 1. 界面五块
 
 | 卡片 | 回答的问题 | 数据来源 |
 | --- | --- | --- |
 | ① 今天动了没有 | 老人今天还活动吗 | `/activity` 的 `last_active_ts` / `motion` / `human_present` |
 | ② 有事没事 | 设备正常吗、告警了吗 | `/health` 全量状态 + `/event` 求助事件弹窗 |
 | ③ 点一下就能看 | 现在画面如何、能不能喊话 | `/stream` MJPEG + 按住说话对讲 |
+| ④ AI 对话 | 能不能让盒子陪老人聊天 | `chat_bridge.py`：大模型 / 小智服务端 → `/audio/alaw` + `/audio/down` |
+| ⑤ 模式切换 | 现在跑看护固件还是小智 AI，一键来回切 | `mode_switch.py`：USB 串口 esptool 整片烧录，不依赖板子 IP |
+
+> 第 ④ 块是可选功能，配置与排障见 **[README_chat.md](README_chat.md)**。
+> 不开它时，前三块和以前完全一样，不会拉任何新连接。
+>
+> 第 ⑤ 块需要板子用 USB 线连着电脑（COM3），固件镜像在
+> `D:\Software\kanhu\xiaozhi-box3\`。切换会重启板子约 1–2 分钟，
+> 期间 ①～④ 会连不上属正常现象；切完刷新页面即可。
+> 完整说明见 `xiaozhi-box3\README.md` §9。
 
 ## 2. 依赖
 
-`pc_console.py` 只用 Python 标准库，**不需要 pip install 任何东西**。
+`pc_console.py` 与 `chat_bridge.py` 的核心都只用 Python 标准库，
+**画面 / 对讲 / 状态 / AI 对话（默认后端）不需要 pip install 任何东西**。
 
-- Python 3.8+（3.12 实测通过）
-- 老人语音录制用到 `audioop`（Python 3.13 已移除）。若在 3.13+ 上运行：
-  `pip install audioop-lts`，或改用 3.12。
+- Python 3.8+（3.12、3.13 实测通过）
+- Python 3.13 移除了 `audioop`，控制台的「录一段老人语音」与对话桥都改用
+  `chat_bridge.py` 内置的 A-law 查表解码（与 `firmware/main/g711.c` 同源），
+  不用再装 `audioop-lts`。
+- 只有切到 `backend: xiaozhi` 才需要 `pip install websockets opuslib` 和 libopus DLL。
 
 ---
 
@@ -58,12 +71,15 @@ IDF 的 `http_server` 客户端 socket 槽位被硬限制在 `max_open_sockets(�
 ## 4. 测试
 
 ```powershell
-python test_console.py    # 端到端功能验收 (8 项)
-python test_stress.py    # 数据面满载下的控制面可用性 (4 项)
+python test_console.py        # 端到端功能验收 (8 项，需接板子)
+python test_stress.py         # 数据面满载下的控制面可用性 (4 项，需接板子)
+python test_chat_bridge.py    # 对话桥离线验收 (11 项，不接板子/不联网/不用 key)
 ```
 
 `test_console.py` 覆盖：健康检查、活动检测、事件轮询、画面代理、
 老人语音上行、对讲下行、事件回执、页面要素。
+`test_chat_bridge.py` 覆盖：A-law 解码、VAD 断句、静音不误触发、
+Mock 对话全链路、重采样、页面卡片与 `/api/chat/*` 四个接口。
 
 ---
 

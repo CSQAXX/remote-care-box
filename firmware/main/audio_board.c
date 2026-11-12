@@ -95,12 +95,38 @@ static volatile bool s_tone_running    = false;
 #define AUDIO_RING_MONO_SAMPLES   8000    /* 500ms @16kHz 单声道 */
 #define AUDIO_RING_STEREO_SAMPLES 8000    /* 500ms @16kHz 双声道 (帧) */
 
+/*
+ * ==================== 共享读通道 (2026-11-08 新增) ====================
+ *
+ * 背景: 唤醒词任务 (wake_word) 和对话采集 (ai_client) 都要读麦克风,
+ * 而原来的 audio_board_read_mono() 是【破坏性读】—— 推进唯一的读指针。
+ * 两个消费者会互相抢数据, 各拿到一半, 结果是唤醒词识别和语音上传都失真。
+ *
+ * 方案: 每个消费者注册一个【独立的读游标】, 各自推进自己的位置,
+ *        谁也不影响谁。写指针仍然只有一个 (采集任务)。
+ *
+ * 用【绝对计数】而不是环形下标做游标:
+ *   - 环形下标没法表达"我要回到 300ms 前" (那是 ai_client 接续唤醒词
+ *     音频时需要的), 绝对计数可以直接 seek。
+ *   - 读者落后太多时 (数据已被覆盖), 直接跳到最新一圈, 丢掉最旧的。
+ *
+ * 槽位 0 保留给原来的 audio_board_read_mono() (子女端听声音那条链路),
+ * 1..N 给唤醒词等新消费者。
+ */
+#define AUDIO_READER_MAX      4
+
+typedef struct {
+    bool    used;
+    int64_t pos;    /* 绝对读计数 (样本数) */
+} audio_reader_t;
+
 static int16_t *s_ring_mono   = NULL;   /* 单声道样本 (上行用) */
 static int16_t *s_ring_stereo = NULL;   /* 双声道交错样本 */
 static size_t   s_ring_mono_w = 0;      /* 写指针 */
-static size_t   s_ring_mono_r = 0;      /* 读指针 */
 static size_t   s_ring_st_w   = 0;
 static size_t   s_ring_st_r   = 0;
+static int64_t  s_mono_total  = 0;      /* 单声道绝对写入计数 */
+static audio_reader_t s_readers[AUDIO_READER_MAX];
 static SemaphoreHandle_t s_ring_lock = NULL;   /* 保护上面的指针 */
 static volatile bool s_downlink_active = false; /* 下行对讲中 -> 上行静音 */
 
@@ -116,9 +142,13 @@ static void ring_write_mono_locked(const int16_t *in, int samples)
     for (int i = 0; i < samples; i++) {
         s_ring_mono[s_ring_mono_w] = in[i];
         s_ring_mono_w = (s_ring_mono_w + 1) % AUDIO_RING_MONO_SAMPLES;
-        if (s_ring_mono_w == s_ring_mono_r) {
-            /* 写满了, 读指针跟着前移一格, 丢最老的一个样本 */
-            s_ring_mono_r = (s_ring_mono_r + 1) % AUDIO_RING_MONO_SAMPLES;
+        s_mono_total++;
+    }
+    /* 数据被覆盖: 把所有落后太多的读者拉回最新一圈 */
+    for (int r = 0; r < AUDIO_READER_MAX; r++) {
+        if (s_readers[r].used &&
+            s_mono_total - s_readers[r].pos > AUDIO_RING_MONO_SAMPLES) {
+            s_readers[r].pos = s_mono_total - AUDIO_RING_MONO_SAMPLES;
         }
     }
 }
@@ -135,16 +165,29 @@ static void ring_write_stereo_locked(const int16_t *in, int frames)
     }
 }
 
-/* 读取单声道样本 (返回实际读到的数量) */
-static int ring_read_mono_locked(int16_t *dest, int want)
+/*
+ * 按【绝对游标】读单声道样本 (调用者持有 lock)。
+ *
+ * reader->pos 是绝对样本计数, 读完之后推进。
+ * 落后太多时 (数据已被覆盖) 直接跳到最新一圈, 丢最旧的 —— 实时音频
+ * 宁可少一点前音, 也不能给出错乱的数据。
+ */
+static int ring_read_mono_at_locked(int16_t *dest, int want, int64_t *pos)
 {
-    int avail = (int)((s_ring_mono_w + AUDIO_RING_MONO_SAMPLES - s_ring_mono_r)
-                      % AUDIO_RING_MONO_SAMPLES);
-    int n = (want < avail) ? want : avail;
-    for (int i = 0; i < n; i++) {
-        dest[i] = s_ring_mono[s_ring_mono_r];
-        s_ring_mono_r = (s_ring_mono_r + 1) % AUDIO_RING_MONO_SAMPLES;
+    int64_t oldest = s_mono_total - AUDIO_RING_MONO_SAMPLES;
+    if (oldest < 0) {
+        oldest = 0;
     }
+    if (*pos < oldest) {
+        *pos = oldest;
+    }
+    int64_t avail = s_mono_total - *pos;
+    int n = (want < avail) ? want : (int)avail;
+    for (int i = 0; i < n; i++) {
+        size_t idx = (size_t)((*pos + i) % AUDIO_RING_MONO_SAMPLES);
+        dest[i] = s_ring_mono[idx];
+    }
+    *pos += n;
     return n;
 }
 
@@ -420,8 +463,13 @@ esp_err_t audio_board_init(void)
                  (AUDIO_RING_MONO_SAMPLES + AUDIO_RING_STEREO_SAMPLES) * (int)sizeof(int16_t));
         goto fail;
     }
-    s_ring_mono_w = s_ring_mono_r = 0;
+    s_ring_mono_w = 0;
     s_ring_st_w   = s_ring_st_r   = 0;
+    s_mono_total  = 0;
+    for (int i = 0; i < AUDIO_READER_MAX; i++) {
+        s_readers[i].used = false;
+        s_readers[i].pos  = 0;
+    }
 
     /*
      * 采集任务是 I2S RX 的唯一读者, 必须在 init 末尾就起来。
@@ -513,9 +561,138 @@ int audio_board_read_mono(int16_t *dest, int sample_count)
         return -1;
     }
     xSemaphoreTake(s_ring_lock, portMAX_DELAY);
-    int n = ring_read_mono_locked(dest, sample_count);
+    /* 槽位 0 是公共游标 (子女端听声音那条链路) */
+    if (!s_readers[0].used) {
+        s_readers[0].used = true;
+        s_readers[0].pos = s_mono_total;   /* 从"现在"开始读, 不抢旧数据 */
+    }
+    int n = ring_read_mono_at_locked(dest, sample_count, &s_readers[0].pos);
     xSemaphoreGive(s_ring_lock);
     return n;
+}
+
+/* ---------------- 共享读通道 (多消费者) ---------------- */
+
+int audio_board_reader_open(void)
+{
+    if (s_ring_lock == NULL) {
+        return -1;
+    }
+    int handle = -1;
+    xSemaphoreTake(s_ring_lock, portMAX_DELAY);
+    for (int i = 0; i < AUDIO_READER_MAX; i++) {
+        if (!s_readers[i].used) {
+            s_readers[i].used = true;
+            s_readers[i].pos = s_mono_total;   /* 从当前时刻开始 */
+            handle = i;
+            break;
+        }
+    }
+    xSemaphoreGive(s_ring_lock);
+    return handle;
+}
+
+void audio_board_reader_close(int handle)
+{
+    if (handle < 0 || handle >= AUDIO_READER_MAX || s_ring_lock == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_ring_lock, portMAX_DELAY);
+    s_readers[handle].used = false;
+    xSemaphoreGive(s_ring_lock);
+}
+
+int audio_board_read_mono_shared(int handle, int16_t *dest, int sample_count)
+{
+    if (!s_ready || dest == NULL || sample_count <= 0) {
+        return -1;
+    }
+    if (s_ring_lock == NULL || handle < 0 || handle >= AUDIO_READER_MAX) {
+        return -1;
+    }
+    xSemaphoreTake(s_ring_lock, portMAX_DELAY);
+    if (!s_readers[handle].used) {
+        xSemaphoreGive(s_ring_lock);
+        return -1;
+    }
+    int n = ring_read_mono_at_locked(dest, sample_count, &s_readers[handle].pos);
+    xSemaphoreGive(s_ring_lock);
+    return n;
+}
+
+/*
+ * 回退读游标 (用于"把唤醒词之后接的上"这类需求)。
+ *
+ * back_samples 不能超过当前游标, 否则会把还没写到的数据读出来。
+ */
+int audio_board_reader_rewind(int handle, int back_samples)
+{
+    return audio_board_reader_seek(handle, -1, back_samples);
+}
+
+/*
+ * 把读游标【定位】到某个绝对样本位置。
+ *
+ * @param handle    读通道句柄
+ * @param abs_pos   绝对位置 (>=0 时生效); <0 表示只做相对回退
+ * @param back      相对回退的样本数 (abs_pos < 0 时生效)
+ *
+ * 唤醒词命中后, ai_client 用这个 API 把游标挪到"命中前 PREROLL",
+ * 于是唤醒词本身 + 后半句都进了这一轮的录音。
+ */
+int audio_board_reader_seek(int handle, int64_t abs_pos, int back)
+{
+    if (s_ring_lock == NULL || handle < 0 || handle >= AUDIO_READER_MAX) {
+        return -1;
+    }
+    xSemaphoreTake(s_ring_lock, portMAX_DELAY);
+    if (!s_readers[handle].used) {
+        xSemaphoreGive(s_ring_lock);
+        return -1;
+    }
+    int64_t oldest = s_mono_total - AUDIO_RING_MONO_SAMPLES;
+    if (oldest < 0) {
+        oldest = 0;
+    }
+    int64_t p;
+    if (abs_pos >= 0) {
+        p = abs_pos;
+    } else {
+        p = s_readers[handle].pos - back;
+    }
+    if (p < oldest) {
+        p = oldest;
+    }
+    if (p > s_mono_total) {
+        p = s_mono_total;   /* 不能读还没写到的数据 */
+    }
+    s_readers[handle].pos = p;
+    xSemaphoreGive(s_ring_lock);
+    return 0;
+}
+
+/* 当前单声道绝对写入计数 (给唤醒词模块算"刚才那会儿"用) */
+int64_t audio_board_mono_total(void)
+{
+    if (s_ring_lock == NULL) {
+        return 0;
+    }
+    xSemaphoreTake(s_ring_lock, portMAX_DELAY);
+    int64_t t = s_mono_total;
+    xSemaphoreGive(s_ring_lock);
+    return t;
+}
+
+/* 读游标当前位置 (绝对样本计数) */
+int64_t audio_board_reader_pos(int handle)
+{
+    if (s_ring_lock == NULL || handle < 0 || handle >= AUDIO_READER_MAX) {
+        return -1;
+    }
+    xSemaphoreTake(s_ring_lock, portMAX_DELAY);
+    int64_t p = s_readers[handle].used ? s_readers[handle].pos : -1;
+    xSemaphoreGive(s_ring_lock);
+    return p;
 }
 
 bool audio_board_is_downlink_active(void)

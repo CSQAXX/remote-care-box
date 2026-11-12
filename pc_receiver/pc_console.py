@@ -13,6 +13,8 @@
   ① 今天动了没有  —— 最近活动时间、今日活动次数、活动曲线
   ② 有事没事    —— 求助事件 / 设备在线 / 音频就绪
   ③ 点一下就能看 —— 实时画面 + 按住说话对讲
+  ④ AI 对话      —— 语言大模型语音对话（chat_bridge.py，可选功能）
+  ⑤ 模式切换     —— 看护固件 ⇄ 小智 AI 固件（mode_switch.py，走 USB 烧录）
 
 用到的板子接口（固件已全部实现）：
   GET  /stream        MJPEG 视频
@@ -144,6 +146,63 @@ INDEX_HTML = r"""<!DOCTYPE html>
         按住「按住说话」→ 电脑麦克风 → 板子喇叭；松手停止。
       </div>
     </div>
+
+    <!-- ④ AI 对话 -->
+    <div class="card">
+      <h3>④ AI 对话（语言大模型）</h3>
+      <div class="row" style="margin-top:0">
+        <button id="btnChat">开启 AI 对话</button>
+        <button class="ghost" id="btnChatSay">文字问一句</button>
+      </div>
+      <div class="muted" id="chatState" style="margin-top:10px">未开启</div>
+      <div class="muted" id="chatProblems" style="color:#b45309;margin-top:6px"></div>
+      <input id="chatText" type="text" placeholder="输入一句话，让盒子念给你听"
+             style="width:100%;margin-top:10px;padding:9px 10px;border:1px solid #d0d7de;
+                    border-radius:8px;font:inherit;box-sizing:border-box">
+      <div id="chatLog" style="margin-top:10px;max-height:170px;overflow:auto;
+           font-size:13px;line-height:1.7"></div>
+    </div>
+
+    <!-- ⑤ 模式切换：看护固件 ⇄ 小智 AI 固件 -->
+    <div class="card" style="grid-column:1/-1">
+      <h3>⑤ 模式切换（看护 ⇄ 小智 AI）</h3>      <div class="row" style="margin-top:0;align-items:center">
+        <div class="big" id="modeNow" style="font-size:20px">检测中…</div>
+        <button id="btnMode">切换模式</button>
+      </div>
+      <div class="muted" id="modeHint" style="margin-top:8px">
+        按一下切到下一个模式，再按一下继续切。三种模式轮流：
+        <b>看护</b> → <b>看护+AI对话</b>（唤醒词「晴老师」+ 云端大模型）→
+        <b>小智 AI</b> → 回到看护。切换走 USB 串口烧录，约 1–2 分钟，
+        期间板子会重启，画面 / 对讲 / 对话会中断；Wi-Fi 和音量会自动保留，不用重新配网。
+        切换完刷新一下本页即可。
+      </div>
+      <div class="muted" id="modeState" style="margin-top:6px"></div>
+      <div id="modeLog" style="margin-top:8px;max-height:110px;overflow:auto;
+           font-size:12px;line-height:1.6;color:#6b7280;white-space:pre-wrap"></div>
+    </div>
+
+    <!-- ⑥ 板端 AI 对话（唤醒词「晴老师」+ 云端大模型） -->
+    <div class="card" style="grid-column:1/-1">
+      <h3>⑥ 板端 AI 对话（唤醒词 + 云端大模型）</h3>
+      <div class="row" style="margin-top:0;align-items:center">
+        <div class="big" id="aiState" style="font-size:20px">--</div>
+        <span class="muted" id="aiWakeName"></span>
+      </div>
+      <table style="margin-top:8px">
+        <tr><td>唤醒词</td><td><span class="tag g" id="tWake">--</span></td>
+            <td>命中次数</td><td id="tWakeHits">--</td></tr>
+        <tr><td>最近概率</td><td id="tWakeProb">--</td>
+            <td>服务器</td><td><span class="tag g" id="tAiConn">--</span></td></tr>
+        <tr><td>对话轮次</td><td id="tAiTurns">--</td>
+            <td>错误数</td><td id="tAiErrs">--</td></tr>
+      </table>
+      <div class="muted" style="margin-top:10px">
+        老人对盒子说「<b id="aiWakeWord">晴老师</b>」→ 盒子离线识别唤醒 →
+        接着说话 → 音频直传云端大模型 → 喇叭播回回复。全程不经本电脑。
+      </div>
+      <div class="muted" style="margin-top:6px" id="aiUser"></div>
+      <div class="muted" style="margin-top:4px;color:#2563eb" id="aiReply"></div>
+    </div>
   </div>
 </div>
 
@@ -243,11 +302,76 @@ async function pollHealth() {
     else if (psrc === 'battery') { st.textContent = '电池供电中'; st.className = 'big warn'; }
     else if (h.push_connected === false) { st.textContent = '设备正常，推送未连'; st.className = 'big warn'; }
     else { st.textContent = '无异常'; st.className = 'big ok'; }
+
+    updateAiCard(h);
   } catch (e) {
     $('dot').className = 'dot';
     $('statusTitle').textContent = '设备离线';
     $('statusTitle').className = 'big bad';
+    $('aiState').textContent = '设备离线';
+    $('aiState').className = 'big bad';
   }
+}
+
+/*
+ * ⑥ 板端 AI 对话卡片。
+ *
+ * 数据全部来自板子 /health 里的 ai_* / wake_* 字段:
+ *   ai_state      当前状态 (空闲/聆听中/思考中/播放中/出错)
+ *   ai_connected  是否连着云端 AI 网关
+ *   ai_turns      累计对话轮次
+ *   ai_replies    累计成功回复
+ *   ai_errors     累计错误
+ *   ai_last_user  最近一次识别到的老人说话
+ *   ai_last_reply 最近一次大模型回复
+ *   wake_ready    唤醒词模型是否加载成功
+ *   wake_hits     唤醒命中次数
+ *   wake_prob     最近一次命中概率
+ *   wake_name     唤醒词名字
+ *
+ * 老固件没有 wake_* 字段 -> 显示"该固件未启用唤醒词", 不报错。
+ */
+function updateAiCard(h) {
+  const hasAi = (h.ai_state !== undefined);
+  if (!hasAi) {
+    $('aiState').textContent = '本固件未启用 AI 对话';
+    $('aiState').className = 'big warn';
+    $('tWake').textContent = '未启用';
+    $('tWake').className = 'tag r';
+    $('aiWakeName').textContent = '';
+    return;
+  }
+
+  const states = {
+    '空闲': '空闲', '聆听中': '聆听中', '思考中': '思考中',
+    '播放中': '播放中', '出错': '出错'
+  };
+  const sname = states[h.ai_state] || h.ai_state;
+  const si = $('aiState');
+  si.textContent = sname;
+  si.className = 'big ' + (h.ai_state === '出错' ? 'bad'
+                        : (h.ai_state === '空闲' ? '' : 'ok'));
+
+  $('aiWakeName').textContent = h.wake_name ? ('唤醒词：' + h.wake_name) : '';
+  if (h.wake_name) $('aiWakeWord').textContent = h.wake_name;
+
+  if (h.wake_ready !== undefined) {
+    setTag($('tWake'), h.wake_ready === true, '就绪', '未就绪');
+    $('tWakeHits').textContent = (h.wake_hits ?? 0) + ' 次';
+    $('tWakeProb').textContent = (h.wake_prob !== undefined && h.wake_prob > 0)
+      ? Number(h.wake_prob).toFixed(3) : '尚无命中';
+  } else {
+    setTag($('tWake'), false, '未启用', '未启用');
+    $('tWakeHits').textContent = '-';
+    $('tWakeProb').textContent = '-';
+  }
+
+  setTag($('tAiConn'), h.ai_connected === true, '已连接', '未连接');
+  $('tAiTurns').textContent = (h.ai_turns ?? 0) + ' 轮';
+  $('tAiErrs').textContent = (h.ai_errors ?? 0) + ' 次';
+
+  $('aiUser').textContent = h.ai_last_user ? ('老人说：' + h.ai_last_user) : '';
+  $('aiReply').textContent = h.ai_last_reply ? ('大模型：' + h.ai_last_reply) : '';
 }
 
 async function pollActivity() {
@@ -346,10 +470,148 @@ $('btnReload').addEventListener('click', () => {
   $('view').src = '/view/stream?t=' + Date.now();
 });
 
-pollEvent(); pollHealth(); pollActivity();
+// ---------- ④ AI 对话 ----------
+/* 对话桥在 PC 端后台线程里跑：拉 /audio/alaw -> VAD -> ASR -> LLM -> TTS
+   -> POST /audio/down。这里只负责开关、状态展示和文字调试。 */
+let chatOn = false, chatBusy = false;
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g,
+    c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+async function pollChat() {
+  try {
+    const s = await (await fetch('/api/chat/status', {cache:'no-store'})).json();
+    chatOn = !!s.running;
+    const map = {idle:'未开启', listening:'正在听', thinking:'正在想', speaking:'正在说',
+                 error:'出错'};
+    const st = (map[s.state] || s.state || '未知');
+    const cnt = (s.stats && s.stats.replies) ? s.stats.replies : 0;
+    $('chatState').textContent = st + (s.detail ? ' · ' + s.detail : '') +
+      ' · 后端 ' + (s.backend || '-') + (cnt ? ' · 已对话 ' + cnt + ' 轮' : '');
+    $('btnChat').textContent = chatOn ? '关闭 AI 对话' : '开启 AI 对话';
+    $('btnChat').className = chatOn ? 'talk active' : '';
+    const p = s.config_problems || [];
+    let msg = p.length ? ('配置待补：' + p.join('；')) : '';
+    if (s.error) msg += (msg ? '；' : '') + '最近错误：' + s.error;
+    $('chatProblems').textContent = msg;
+    let html = '';
+    for (const r of (s.rounds || []).slice().reverse()) {
+      html += '<div style="margin-bottom:6px">' +
+        '<span style="color:#2563eb;font-weight:600">' + esc(r.user || '(语音)') + '</span><br>' +
+        '<span style="color:#374151">' + esc(r.reply || '(小智服务端语音回复)') + '</span>' +
+        '<span class="muted"> · ' + esc(r.ts) + '</span></div>';
+    }
+    $('chatLog').innerHTML = html || '<span class="muted">还没有对话记录</span>';
+  } catch (e) {
+    $('chatState').textContent = '对话桥未加载：' + e.message;
+  }
+}
+$('btnChat').addEventListener('click', async () => {
+  if (chatBusy) return;
+  chatBusy = true; $('btnChat').disabled = true;
+  try {
+    const r = await (await fetch('/api/chat/' + (chatOn ? 'stop' : 'start'),
+      {method:'POST'})).json();
+    if (!r.ok) alert((r.msg || '操作失败') + '\n' + (r.problems || []).join('\n'));
+    await pollChat();
+  } finally { chatBusy = false; $('btnChat').disabled = false; }
+});
+$('btnChatSay').addEventListener('click', async () => {
+  const t = $('chatText').value.trim();
+  if (!t) { $('chatText').focus(); return; }
+  const r = await (await fetch('/api/chat/say', {method:'POST', body:t})).json();
+  if (!r.ok) alert((r.msg || '提交失败') + '\n' + (r.problems || []).join('\n'));
+  else $('chatText').value = '';
+  await pollChat();
+});
+$('chatText').addEventListener('keydown', e => {
+  if (e.key === 'Enter') $('btnChatSay').click();
+});
+
+// ---------- ⑤ 模式切换 ----------
+/* 两套固件轮流跑：后端用 esptool 走 USB 整片烧录，不依赖板子 IP。
+   这里只负责显示当前模式、按一下发起切换、轮询进度与结果。 */
+let modeBusy = false;
+let modeArmed = 0;        // 0=未确认；非 0=已点过一次，等第二次确认
+let modeArmTimer = null;
+async function pollMode() {
+  try {
+    const s = await (await fetch('/api/mode/status', {cache:'no-store'})).json();
+    modeBusy = !!s.busy;
+    const nextName = s.next === 'xiaozhi' ? '切成小智 AI'
+                   : (s.next === 'kanhu-ai' ? '切成看护+AI对话' : '回到看护模式');
+    $('modeNow').textContent = s.busy
+      ? ('切换中 → ' + (s.target === 'xiaozhi' ? '小智 AI'
+                       : (s.target === 'kanhu-ai' ? '看护+AI对话' : '看护模式')))
+      : (s.mode_name || '检测中');
+    $('modeNow').className = s.busy ? 'big warn' : 'big';
+    const btn = $('btnMode');
+    if (modeArmed && !s.busy) {
+      // 已进入二次确认：保持提示，别被轮询刷掉
+      btn.disabled = false;
+      btn.textContent = '再点一下 = 开始切换';
+    } else {
+      btn.disabled = s.busy || !s.ready;
+      btn.textContent = s.busy ? ('切换中… ' + s.elapsed + ' 秒') : nextName;
+    }
+    let msg = s.busy ? (s.phase + ' · 请勿断电或拔 USB') : (s.last_result || '');
+    if (!s.ready) msg += ' ⚠ 工具未就绪：' + (s.problems || []).join('；');
+    if (!modeArmed) $('modeState').textContent = msg;
+    $('modeLog').textContent = (s.log || []).slice(-6).join('\n');
+  } catch (e) {
+    $('modeState').textContent = '模式切换模块未加载：' + e.message;
+  }
+}
+$('btnMode').addEventListener('click', async () => {
+  if (modeBusy) return;
+  const btn = $('btnMode');
+  // 两步确认：不用 confirm()/alert() —— 内置预览面板会拦掉系统弹窗，
+  // confirm() 直接返回 false，表现为"点了没反应"。
+  if (!modeArmed) {
+    modeArmed = Date.now();
+    btn.textContent = '再点一下 = 开始切换';
+    $('modeState').textContent = '已收到点击：6 秒内再点一次即开始烧录（板子会重启 1–2 分钟）';
+    if (modeArmTimer) clearTimeout(modeArmTimer);
+    modeArmTimer = setTimeout(() => {
+      modeArmed = 0; modeArmTimer = null;
+      $('modeState').textContent = '已取消：超时未再次确认';
+      pollMode();
+    }, 6000);
+    return;
+  }
+  modeArmed = 0;
+  if (modeArmTimer) { clearTimeout(modeArmTimer); modeArmTimer = null; }
+  modeBusy = true; btn.disabled = true;
+  $('modeState').textContent = '正在启动切换…';
+  $('modeLog').textContent = '已提交，请勿断电 / 拔 USB…';
+  try {
+    const r = await (await fetch('/api/mode/switch', {method:'POST'})).json();
+    if (!r.ok) {
+      $('modeState').textContent = '切换失败：' + (r.msg || '未知错误');
+      $('modeLog').textContent = (r.problems || []).join('\n') || (r.msg || '');
+    } else if (r.busy) {
+      $('modeState').textContent = '切换中 · 请勿断电或拔 USB';
+    }
+  } catch (e) {
+    $('modeState').textContent = '请求失败：' + e.message;
+  } finally {
+    modeBusy = false;
+    await pollMode();
+  }
+});
+
+// 页面内报错可见，免得 JS 异常时"点了没反应"
+window.addEventListener('error', ev => {
+  const box = $('modeState');
+  if (box) box.textContent = '页面脚本报错：' + (ev.message || '');
+});
+
+pollEvent(); pollHealth(); pollActivity(); pollChat(); pollMode();
 setInterval(pollEvent, 700);
 setInterval(pollHealth, 2000);
 setInterval(pollActivity, 5000);
+setInterval(pollChat, 1500);
+setInterval(pollMode, 1500);
 </script>
 </body>
 </html>
@@ -674,12 +936,52 @@ class SharedStream:
 
 STREAM = None
 
+# --------------------------------------------------------------------------
+# AI 对话桥（可选功能，惰性加载）
+# --------------------------------------------------------------------------
+# 故意不在模块顶层 import：控制台本身零第三方依赖，对话桥也是纯标准库实现，
+# 配置没填或模块有问题时不能拖累原有的画面 / 对讲 / 状态功能。
+CHAT = None
+
+
+def get_chat(device):
+    global CHAT
+    if CHAT is None:
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from chat_bridge import ChatBridge
+        CHAT = ChatBridge(device=device)
+    return CHAT
+
+
+MODE = None
+
+
+def get_mode(device):
+    """模式切换器同样惰性加载：镜像或工具没配好也不能拖累原有页面。"""
+    global MODE
+    if MODE is None:
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from mode_switch import ModeSwitcher
+        MODE = ModeSwitcher(device)
+    return MODE
+
 
 def alaw_to_wav(alaw_bytes, sample_rate=ALAW_SAMPLE_RATE):
-    """G.711 A-law -> 16-bit PCM WAV。"""
-    if audioop is None:
-        return None, None
-    pcm = audioop.alaw2lin(alaw_bytes, 2)
+    """G.711 A-law -> 16-bit PCM WAV。
+
+    Python 3.13 移除了 audioop，这里改用 chat_bridge 内置的查表解码
+    （与 firmware/main/g711.c 一致），顺手把「录一段老人语音」救回来。
+    """
+    if audioop is not None:
+        pcm = audioop.alaw2lin(alaw_bytes, 2)
+    else:
+        try:
+            from chat_bridge import alaw_to_pcm
+            pcm = alaw_to_pcm(alaw_bytes)
+        except Exception:
+            return None, None
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(1)
@@ -810,7 +1112,7 @@ def app(environ, start_response):
             src.close()
             wav, _ = alaw_to_wav(alaw)
             if wav is None:
-                return json_resp({"error": "audioop 不可用 (Python 3.13+ 需要 pip install audioop-lts)"}, 500)
+                return json_resp({"error": "A-law 解码不可用 (chat_bridge 加载失败)"}, 500)
             start_response("200 OK", [("Content-Type", "audio/wav"),
                                       ("Content-Length", str(len(wav)))])
             return [wav]
@@ -828,6 +1130,42 @@ def app(environ, start_response):
             return json_resp({"ok": True, "bytes": len(pcm)})
         except Exception as e:
             return json_resp({"ok": False, "error": str(e)}, 500)
+
+    # ---- AI 对话桥: 开关 / 状态 / 文字调试 ----
+    if path.startswith("/api/chat/"):
+        try:
+            chat = get_chat(device)
+        except Exception as e:
+            return json_resp({"running": False, "state": "error", "detail": "-",
+                              "error": "对话桥加载失败: %s" % e,
+                              "backend": "-", "config_problems": [],
+                              "rounds": [], "stats": {}}, 500)
+        if path == "/api/chat/status":
+            return json_resp(chat.status())
+        if method == "POST":
+            n = int(environ.get("CONTENT_LENGTH") or 0)
+            body = environ["wsgi.input"].read(n).decode("utf-8", "replace") if n else ""
+            if path == "/api/chat/start":
+                return json_resp(chat.start())
+            if path == "/api/chat/stop":
+                return json_resp(chat.stop())
+            if path == "/api/chat/say":
+                return json_resp(chat.say(body))
+        return json_resp({"ok": False, "msg": "unknown chat api"}, 404)
+
+    # ---- ⑤ 模式切换: 看护固件 <-> 小智固件 (USB 串口整片烧录) ----
+    if path.startswith("/api/mode/"):
+        try:
+            ms = get_mode(device)
+        except Exception as e:
+            return json_resp({"ready": False, "mode": "unknown", "busy": False,
+                              "problems": ["模式切换模块加载失败: %s" % e],
+                              "log": [], "last_result": ""}, 500)
+        if path == "/api/mode/status":
+            return json_resp(ms.status())
+        if path == "/api/mode/switch" and method == "POST":
+            return json_resp(ms.switch())
+        return json_resp({"ok": False, "msg": "unknown mode api"}, 404)
 
     start_response("404 Not Found", [("Content-Type", "text/plain")])
     return [b"not found"]
@@ -896,6 +1234,8 @@ def main():
 
     print(f"设备: {args.device}:{DEVICE_PORT}")
     print(f"控制台: http://{args.host}:{args.port}")
+    print("AI 对话: 页面「④ AI 对话」里开启；配置见 pc_receiver/chat_config.json")
+    print("模式切换: 页面「⑤ 模式切换」一键在看护固件 ⇄ 小智 AI 之间切换（USB 串口烧录）")
     print("Ctrl+C 退出")
 
     # 必须多线程: MJPEG 是长连接, 单线程 wsgiref 会把 /api/talk 等请求全堵住

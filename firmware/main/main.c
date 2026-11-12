@@ -78,6 +78,9 @@
 #include "push_client.h"
 #include "reliability.h"
 #include "power_board.h"
+#include "ai_client.h"
+#include "wake_word.h"
+#include "voice_mode.h"
 
 #include <math.h>
 
@@ -1358,8 +1361,24 @@ static void wifi_init(void)
             .scan_method = WIFI_ALL_CHANNEL_SCAN,
         },
     };
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+    /*
+     * 顺序很重要: 必须先 esp_wifi_set_mode() 再 esp_wifi_set_config()。
+     *
+     * esp_wifi_init() 之后模式是 WIFI_MODE_NULL, 此时直接
+     * esp_wifi_set_config(WIFI_IF_STA, ...) 会返回
+     * ESP_ERR_WIFI_MODE (0x3005), 下面这行 ESP_ERROR_CHECK 会直接
+     * abort() -> 板子无限重启 -> 每次重启播一声开机自检音
+     * (听起来就是"一直嘀嘀嘀")。
+     *
+     * 【2026-11-08 实测踩坑】原来这里两行是反的:
+     *     set_config(STA) -> set_mode(STA)   // 必崩
+     * 正确的是:
+     *     set_mode(STA)   -> set_config(STA) -> start()
+     *
+     * AP 分支早就写对了 (见上面那段注释), 只有 STA 分支漏改。
+     */
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_LOGI(TAG, "Wi-Fi STA 模式启动中 (SSID=%s, 认证=%s)",
@@ -3896,7 +3915,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
              * TCP 会返回错误, 我们就能立刻感知断开并释放 socket。
              */
             static int idle_ticks = 0;
-            if (++idle_ticks >= 10) {   /* 每 20ms 一次 -> 200ms 探一次 */
+            if (++idle_ticks >= 25) {   /* 每 20ms 一次 -> 500ms 探一次 */
                 idle_ticks = 0;
                 if (!stream_client_alive(req)) {
                     ESP_LOGI(TAG, "画面客户端已断开 (socket 探测发现)");
@@ -3925,25 +3944,6 @@ static esp_err_t stream_handler(httpd_req_t *req)
             break;
         }
         s_frame_count++;
-
-        /*
-         * 【2026-11-07 新增】发完一帧就探测一次客户端是否还在。
-         *
-         * 为什么不能只在"等不到新帧"时探测:
-         *   正常帧率 5fps, 每 190ms 就有新帧, 于是几乎永远走不到
-         *   那个分支 —— 客户端断开只能等下一次 send_chunk 失败,
-         *   而 TCP 发送失败要等内核重传超时 (可能好几秒), 期间
-         *   socket 和 STREAM_MAX_CLIENTS 配额一直被占着。
-         *
-         * 现场: 断连测试连开 3 路流后, 8080 直接连不上 (连接超时),
-         *       因为 2 个流配额被"已死但未释放"的连接占满。
-         *
-         * MSG_PEEK 是零副作用的, 每帧一次的开销可以忽略。
-         */
-        if (!stream_client_alive(req)) {
-            ESP_LOGI(TAG, "画面客户端已断开 (发帧后探测发现)");
-            break;
-        }
     }
 
     s_stream_clients--;
@@ -4231,7 +4231,40 @@ static esp_err_t health_handler(httpd_req_t *req)
     if (pst.source == POWER_SOURCE_TYPEC)        psrc = "typec";
     else if (pst.source == POWER_SOURCE_BATTERY)  psrc = "battery";
 
-    char resp[896];
+    /*
+     * AI 对话状态。
+     *
+     * 为什么要放进 /health:
+     *   "老人跟盒子说话, 盒子有没有听清? 大模型回了什么? 服务器连上了吗?"
+     *   这三个问题是排查语音对话的唯一入口 —— 而且不需要人对着板子说话,
+     *   看日志就行。
+     *
+     * ai_last_user / ai_last_reply 是中文, 直接放进 JSON 会有转义问题,
+     * 所以这里做了简单清洗 (去掉引号/反斜杠/控制字符)。
+     */
+    ai_client_stats_t ais;
+    ai_client_get_stats(&ais);
+    {
+        /* 清洗: JSON 字符串里不能有裸引号/反斜杠 */
+        char *dst = ais.last_user;
+        size_t cap = sizeof(ais.last_user);
+        for (size_t i = 0; dst[i] && i + 1 < cap; i++) {
+            char c = dst[i];
+            if (c == '"' || c == '\\' || (unsigned char)c < 0x20) {
+                dst[i] = ' ';
+            }
+        }
+        dst = ais.last_reply;
+        cap = sizeof(ais.last_reply);
+        for (size_t i = 0; dst[i] && i + 1 < cap; i++) {
+            char c = dst[i];
+            if (c == '"' || c == '\\' || (unsigned char)c < 0x20) {
+                dst[i] = ' ';
+            }
+        }
+    }
+
+    char resp[1536];
     snprintf(resp, sizeof(resp),
              "{\"ip\":\"" IPSTR "\",\"uptime\":%llu,\"frames\":%" PRIu32 ",\"clients\":%d,\"long_conns\":%d,"
              "\"psram\":%" PRIu32 ","
@@ -4251,7 +4284,10 @@ static esp_err_t health_handler(httpd_req_t *req)
              "\"battery_pct\":%d,\"battery_mv\":%d,\"battery_valid\":%s,"
              "\"push_connected\":%s,\"push_sent\":%u,\"push_jpegs\":%u,"
              "\"push_replayed\":%u,\"push_dropped\":%u,\"push_queued\":%u,"
-             "\"push_fails\":%u,\"push_backoff_ms\":%u}",
+             "\"push_fails\":%u,\"push_backoff_ms\":%u,"
+             "\"ai_state\":\"%s\",\"ai_connected\":%s,\"ai_turns\":%u,\"ai_replies\":%u,"
+             "\"ai_errors\":%u,\"ai_last_user\":\"%s\",\"ai_last_reply\":\"%s\","
+             "\"wake_ready\":%s,\"wake_hits\":%u,\"wake_prob\":%.3f,\"wake_name\":\"%s\"}",
              IP2STR(&ip.ip),
              (unsigned long long)(esp_timer_get_time() / 1000),
              (uint32_t)s_frame_count,
@@ -4300,7 +4336,20 @@ static esp_err_t health_handler(httpd_req_t *req)
              (unsigned)ps.dropped,
              (unsigned)ps.queued,
              (unsigned)ps.connect_fails,
-             (unsigned)ps.backoff_ms);
+             (unsigned)ps.backoff_ms,
+             /* AI 对话 */
+             ai_client_state_str(),
+             ai_client_is_connected() ? "true" : "false",
+             (unsigned)ais.turns,
+             (unsigned)ais.replies,
+             (unsigned)ais.errors,
+             ais.last_user,
+             ais.last_reply,
+             /* 唤醒词「晴老师」 */
+             wake_word_is_ready() ? "true" : "false",
+             (unsigned)wake_word_hit_count(),
+             (double)wake_word_last_prob(),
+             WAKE_WORD_NAME);
 
     httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
@@ -5884,6 +5933,96 @@ static void uart_cmd_task(void *arg)
                      * 用来区分"没装电池"和"我们控制脚用错了"。
                      */
                     power_board_diagnose();
+                } else if (strncmp(line, "ai", 2) == 0 &&
+                           (line[2] == '\0' || line[2] == ' ')) {
+                    /*
+                     * AI 对话调试。
+                     *
+                     *   ai        打印状态 (连接/轮次/最近一轮对话内容)
+                     *   ai go     手动发起一轮对话 (不依赖唤醒词)
+                     *
+                     * 为什么要有 "ai go":
+                     *   唤醒词 (esp-sr) 一旦不准, 就没法验证"采集->上传->播放"
+                     *   这条链路到底通没通。手动触发把【唤醒】这一环摘掉,
+                     *   剩下的环节能独立验证 —— 排障时非常关键。
+                     */
+                    const char *cmd = line + 2;
+                    while (*cmd == ' ') cmd++;
+
+                    if (strcmp(cmd, "go") == 0) {
+                        ESP_LOGI(TAG, "手动发起一轮 AI 对话...");
+                        esp_err_t r = ai_client_start_turn();
+                        if (r != ESP_OK) {
+                            ESP_LOGE(TAG, "发起失败: %s", esp_err_to_name(r));
+                        }
+                    } else {
+                        ai_client_stats_t s;
+                        ai_client_get_stats(&s);
+                        ESP_LOGI(TAG, "AI 状态: %s  连接=%s",
+                                 ai_client_state_str(),
+                                 s.connected ? "是" : "否");
+                        ESP_LOGI(TAG, "AI 统计: 轮次=%u 回复=%u 错误=%u 连接失败=%u",
+                                 (unsigned)s.turns, (unsigned)s.replies,
+                                 (unsigned)s.errors, (unsigned)s.connect_fails);
+                        ESP_LOGI(TAG, "AI 最近识别: %s", s.last_user);
+                        ESP_LOGI(TAG, "AI 最近回复: %s", s.last_reply);
+                    }
+                } else if (strcmp(line, "wake") == 0) {
+                    /*
+                     * 唤醒词调试。
+                     *
+                     *   wake              打印状态 (就绪/命中次数/概率/门限)
+                     *   wake go           手动触发一次唤醒 (不依赖模型识别)
+                     *   wake threshold 0.6 现场调检测门限 (0.0~0.9999)
+                     */
+                    const char *cmd = line + 4;
+                    while (*cmd == ' ') cmd++;
+
+                    if (strncmp(cmd, "threshold", 9) == 0) {
+                        const char *arg = cmd + 9;
+                        while (*arg == ' ') arg++;
+                        if (*arg == '\0') {
+                            ESP_LOGI(TAG, "当前门限: %.2f", wake_word_last_prob());
+                        } else {
+                            float t = atof(arg);
+                            esp_err_t r = wake_word_set_threshold(t);
+                            if (r != ESP_OK) {
+                                ESP_LOGE(TAG, "门限设置失败: %s", esp_err_to_name(r));
+                            }
+                        }
+                    } else if (strcmp(cmd, "go") == 0) {
+                        ESP_LOGI(TAG, "手动触发唤醒...");
+                        esp_err_t r = wake_word_trigger_manual();
+                        if (r != ESP_OK) {
+                            ESP_LOGE(TAG, "触发失败: %s", esp_err_to_name(r));
+                        }
+                    } else {
+                        wake_word_dump_status();
+                    }
+                } else if (strcmp(line, "voice") == 0 ||
+                           strncmp(line, "voice ", 6) == 0) {
+                    /*
+                     * 语音模式 (一套固件两种用法)。
+                     * 命令名不能用 "mode" —— 那个已被摄像头传感器模式占用。
+                     *
+                     *   voice            打印当前模式
+                     *   voice xiaozhi    手动切到小智聊天
+                     *   voice care       手动切回看护对讲
+                     *
+                     * 平时不用敲 —— 喊「小康同学」/「晴老师」自动切。
+                     */
+                    const char *cmd = line + 5;
+                    while (*cmd == ' ') cmd++;
+
+                    if (strcmp(cmd, "xiaozhi") == 0 || strcmp(cmd, "x") == 0) {
+                        voice_mode_set(VOICE_MODE_XIAOZHI);
+                        ESP_LOGI(TAG, "已切换到小智模式");
+                    } else if (strcmp(cmd, "care") == 0 || strcmp(cmd, "c") == 0) {
+                        voice_mode_set(VOICE_MODE_CARE);
+                        ESP_LOGI(TAG, "已切回看护对讲模式");
+                    } else {
+                        voice_mode_dump_status();
+                    }
                 } else if (strcmp(line, "ispeed") == 0) {
                     i2c_speed_probe();
                 } else if (strcmp(line, "iprobe") == 0) {
@@ -6689,6 +6828,41 @@ void app_main(void)
         power_board_start_monitor();
     } else {
         ESP_LOGW(TAG, "电源管理初始化失败, 无法读取电池电量");
+    }
+
+    /*
+     * ============ AI 对话客户端 ============
+     *
+     * 启动后台任务, 让板子能直接跟服务器上的大模型对话。
+     *
+     * 为什么放在最后启动:
+     *   音频子系统 (audio_board_init) 必须已经就绪, 否则采集不到语音。
+     *   失败也不影响其它功能 —— 视频、按键、告警照常。
+     */
+    if (ai_client_start() == ESP_OK) {
+        ESP_LOGI(TAG, "AI 对话客户端已启动 (串口命令 ai 手动发起一轮对话)");
+    } else {
+        ESP_LOGW(TAG, "AI 对话客户端启动失败, 语音对话不可用");
+    }
+
+    /*
+     * ============ 离线唤醒词「晴老师」 ============
+     *
+     * 必须放在 ai_client_start() 之后: 唤醒词命中时会调
+     * ai_client_start_turn_at(), 那边得已经起来了。
+     *
+     * 失败不影响其它功能 —— 老人还可以用按键/手环触发告警,
+     * 串口 "ai go" 也能手动发起对话。
+     */
+    if (wake_word_start() == ESP_OK) {
+        ESP_LOGI(TAG, "唤醒词「%s」已就绪 (串口命令 wake 查看状态)", "晴老师");
+        /*
+         * 一套固件两种用法: 默认看护对讲, 喊「小康同学」切到小智。
+         * 打一行状态, 开机日志里就能确认两句口令都注册上了。
+         */
+        voice_mode_dump_status();
+    } else {
+        ESP_LOGW(TAG, "唤醒词启动失败, 只能手动触发对话 (串口 ai go)");
     }
 
 #if LCD_SELFTEST_ONLY

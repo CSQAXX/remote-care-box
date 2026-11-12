@@ -78,6 +78,29 @@ int audio_board_write(const int16_t *src, int sample_count);
  */
 int audio_board_read_mono(int16_t *dest, int sample_count);
 
+/* ---- 共享读通道 (2026-11-08 新增) ----
+ *
+ * 为什么需要:
+ *   唤醒词任务 (wake_word) 和对话采集 (ai_client) 都要读麦克风。
+ *   audio_board_read_mono() 是【破坏性读】, 两个消费者会互相抢数据 ——
+ *   各拿一半, 唤醒词识别和语音上传都失真。
+ *
+ * 用法:
+ *   int h = audio_board_reader_open();          // 申请一个独立游标
+ *   audio_board_read_mono_shared(h, buf, 320);  // 读, 不影响别人
+ *   audio_board_reader_close(h);
+ *
+ * audio_board_reader_rewind() 可以把游标往回退 (接续唤醒词之前的音频),
+ * 这是"晴老师今天天气怎么样"不丢前半句的关键。
+ */
+int  audio_board_reader_open(void);
+void audio_board_reader_close(int handle);
+int  audio_board_read_mono_shared(int handle, int16_t *dest, int sample_count);
+int  audio_board_reader_rewind(int handle, int back_samples);
+int  audio_board_reader_seek(int handle, int64_t abs_pos, int back);
+int64_t audio_board_mono_total(void);
+int64_t audio_board_reader_pos(int handle);
+
 /* ---- 下行链路 (云端 -> 设备喇叭) ---- */
 
 /*
